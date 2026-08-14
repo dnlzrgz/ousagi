@@ -45,14 +45,7 @@ impl Connection {
                         keys: keys.iter().map(|s| s.to_string()).collect(),
                     }));
                 }
-                ["set", key, flags, exptime, bytes_len] => {
-                    let key: String = match key.parse() {
-                        Ok(key) => key,
-                        Err(_) => {
-                            self.write_response(&Response::Error).await?;
-                            continue;
-                        }
-                    };
+                ["set", key, flags, exptime, bytes_len, rest @ ..] => {
                     let flags: u32 = match flags.parse() {
                         Ok(flags) => flags,
                         Err(_) => {
@@ -60,8 +53,14 @@ impl Connection {
                             continue;
                         }
                     };
-                    // TODO:
-                    let exptime: i64 = exptime.parse().unwrap();
+
+                    let exptime: i64 = match exptime.parse() {
+                        Ok(exptime) => exptime,
+                        Err(_) => {
+                            self.write_response(&Response::Error).await?;
+                            continue;
+                        }
+                    };
 
                     let bytes_len: usize = match bytes_len.parse() {
                         Ok(n) => n,
@@ -71,12 +70,12 @@ impl Connection {
                         }
                     };
 
-                    // TODO: check if correct
+                    let noreply = matches!(rest, ["noreply"]);
+
                     let mut data = BytesMut::zeroed(bytes_len);
                     self.reader.read_exact(&mut data).await?;
                     let data = data.freeze();
 
-                    // TODO: consume the remaining CLRF
                     let mut crlf = [0u8; 2];
                     self.reader.read_exact(&mut crlf).await?;
                     if crlf != *b"\r\n" {
@@ -85,26 +84,18 @@ impl Connection {
                     }
 
                     return Ok(Some(Command::Set {
-                        key,
+                        key: key.to_string(),
                         flags,
                         exptime,
                         data,
-                        // FIX:
-                        noreply: false,
+                        noreply,
                     }));
                 }
-                ["delete", key] => {
-                    let key: String = match key.parse() {
-                        Ok(key) => key,
-                        Err(_) => {
-                            self.write_response(&Response::Error).await?;
-                            continue;
-                        }
-                    };
-
+                ["delete", key, rest @ ..] => {
+                    let noreply = matches!(rest, ["noreply"]);
                     return Ok(Some(Command::Delete {
-                        key,
-                        noreply: false,
+                        key: key.to_string(),
+                        noreply,
                     }));
                 }
                 _ => {
