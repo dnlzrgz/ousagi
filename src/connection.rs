@@ -1,6 +1,6 @@
 use std::io;
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     net::{
@@ -93,6 +93,20 @@ impl Connection {
                         noreply: false,
                     }));
                 }
+                ["delete", key] => {
+                    let key: String = match key.parse() {
+                        Ok(key) => key,
+                        Err(_) => {
+                            self.write_response(&Response::Error).await?;
+                            continue;
+                        }
+                    };
+
+                    return Ok(Some(Command::Delete {
+                        key,
+                        noreply: false,
+                    }));
+                }
                 _ => {
                     self.write_response(&Response::Error).await?;
                     continue;
@@ -150,7 +164,13 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
 
             Response::Values(values)
         }
-        _ => unimplemented!(),
+        Command::Delete { key, noreply: _ } => {
+            let mut store = store.lock().unwrap();
+            match store.remove(&key) {
+                Some(_) => Response::Deleted,
+                None => Response::NotFound,
+            }
+        }
     }
 }
 
