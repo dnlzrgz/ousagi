@@ -1,7 +1,8 @@
 use std::io;
 
+use bytes::{Bytes, BytesMut};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     net::{
         TcpStream,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -10,7 +11,7 @@ use tokio::{
 
 use crate::{
     commands::{Command, Response},
-    store::Store,
+    store::{Item, Store},
 };
 
 pub(crate) struct Connection {
@@ -42,6 +43,54 @@ impl Connection {
                 ["get", keys @ ..] if !keys.is_empty() => {
                     return Ok(Some(Command::Get {
                         keys: keys.iter().map(|s| s.to_string()).collect(),
+                    }));
+                }
+                ["set", key, flags, exptime, bytes_len] => {
+                    let key: String = match key.parse() {
+                        Ok(key) => key,
+                        Err(_) => {
+                            self.write_response(&Response::Error).await?;
+                            continue;
+                        }
+                    };
+                    let flags: u32 = match flags.parse() {
+                        Ok(flags) => flags,
+                        Err(_) => {
+                            self.write_response(&Response::Error).await?;
+                            continue;
+                        }
+                    };
+                    // TODO:
+                    let exptime: i64 = exptime.parse().unwrap();
+
+                    let bytes_len: usize = match bytes_len.parse() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            self.write_response(&Response::Error).await?;
+                            continue;
+                        }
+                    };
+
+                    // TODO: check if correct
+                    let mut data = BytesMut::zeroed(bytes_len);
+                    self.reader.read_exact(&mut data).await?;
+                    let data = data.freeze();
+
+                    // TODO: consume the remaining CLRF
+                    let mut crlf = [0u8; 2];
+                    self.reader.read_exact(&mut crlf).await?;
+                    if crlf != *b"\r\n" {
+                        self.write_response(&Response::Error).await?;
+                        continue;
+                    }
+
+                    return Ok(Some(Command::Set {
+                        key,
+                        flags,
+                        exptime,
+                        data,
+                        // FIX:
+                        noreply: false,
                     }));
                 }
                 _ => {
@@ -76,6 +125,18 @@ impl Connection {
 
 pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
     match cmd {
+        Command::Set {
+            key,
+            flags,
+            exptime: _, // TODO:
+            data,
+            noreply: _, // TODO:
+        } => {
+            let mut store = store.lock().unwrap();
+            let item = Item::new(data, flags);
+            store.insert(key, item);
+            Response::Stored
+        }
         Command::Get { keys } => {
             let store = store.lock().unwrap();
             let values = keys
