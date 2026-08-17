@@ -64,7 +64,15 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                         continue;
                     }
 
-                    let noreply = matches!(rest, ["noreply"]);
+                    let noreply = match rest {
+                        [] => false,
+                        ["noreply"] => true,
+                        _ => {
+                            self.discard_exact(bytes_len + 2).await?;
+                            self.write_response(&Response::Error).await?;
+                            continue;
+                        }
+                    };
 
                     let mut data = BytesMut::zeroed(bytes_len);
                     self.reader.read_exact(&mut data).await?;
@@ -86,7 +94,15 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                     }));
                 }
                 ["delete", key, rest @ ..] => {
-                    let noreply = matches!(rest, ["noreply"]);
+                    let noreply = match rest {
+                        [] => false,
+                        ["noreply"] => true,
+                        _ => {
+                            self.write_response(&Response::Error).await?;
+                            continue;
+                        }
+                    };
+
                     return Ok(Some(Command::Delete {
                         key: key.to_string(),
                         noreply,
