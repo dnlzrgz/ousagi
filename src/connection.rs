@@ -2,11 +2,10 @@ use std::io;
 
 use bytes::BytesMut;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
-    net::{
-        TcpStream,
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
+    io::{
+        AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
     },
+    net::TcpStream,
 };
 
 use crate::{
@@ -14,18 +13,20 @@ use crate::{
     store::{Item, Store},
 };
 
-pub(crate) struct Connection {
-    reader: BufReader<OwnedReadHalf>,
-    writer: BufWriter<OwnedWriteHalf>,
+pub(crate) struct Connection<R, W> {
+    reader: BufReader<R>,
+    writer: BufWriter<W>,
     line: String,
 }
 
-impl Connection {
-    fn new(socket: TcpStream) -> Self {
-        let (r, w) = socket.into_split();
+/// Default max item size.
+const MAX_ITEM_SIZE: usize = 1024 * 1024; // 1 MiB
+
+impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
+    fn new(reader: R, writer: W) -> Self {
         Connection {
-            reader: BufReader::new(r),
-            writer: BufWriter::new(w),
+            reader: BufReader::new(reader),
+            writer: BufWriter::new(writer),
             line: String::new(),
         }
     }
@@ -46,29 +47,22 @@ impl Connection {
                     }));
                 }
                 ["set", key, flags, exptime, bytes_len, rest @ ..] => {
-                    let flags: u32 = match flags.parse() {
-                        Ok(flags) => flags,
-                        Err(_) => {
-                            self.write_response(&Response::Error).await?;
-                            continue;
-                        }
+                    let Ok(bytes_len) = bytes_len.parse::<usize>() else {
+                        self.write_response(&Response::Error).await?;
+                        return Ok(None); // desync, must close
                     };
 
-                    let exptime: i64 = match exptime.parse() {
-                        Ok(exptime) => exptime,
-                        Err(_) => {
-                            self.write_response(&Response::Error).await?;
-                            continue;
-                        }
+                    let (Ok(flags), Ok(exptime)) = (flags.parse(), exptime.parse()) else {
+                        self.discard_exact(bytes_len + 2).await?;
+                        self.write_response(&Response::Error).await?;
+                        continue;
                     };
 
-                    let bytes_len: usize = match bytes_len.parse() {
-                        Ok(n) => n,
-                        Err(_) => {
-                            self.write_response(&Response::Error).await?;
-                            continue;
-                        }
-                    };
+                    if bytes_len > MAX_ITEM_SIZE {
+                        self.discard_exact(bytes_len + 2).await?;
+                        self.write_response(&Response::Error).await?;
+                        continue;
+                    }
 
                     let noreply = matches!(rest, ["noreply"]);
 
@@ -126,6 +120,12 @@ impl Connection {
 
         self.writer.flush().await
     }
+
+    async fn discard_exact(&mut self, n: usize) -> io::Result<()> {
+        let mut limited = (&mut self.reader).take(n as u64);
+        tokio::io::copy(&mut limited, &mut tokio::io::sink()).await?;
+        Ok(())
+    }
 }
 
 pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
@@ -166,7 +166,8 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
 }
 
 pub async fn process(socket: TcpStream, store: Store) -> io::Result<()> {
-    let mut conn = Connection::new(socket);
+    let (r, w) = socket.into_split();
+    let mut conn = Connection::new(r, w);
 
     while let Some(cmd) = conn.read_command().await? {
         let noreply = cmd.noreply();
