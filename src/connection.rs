@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, time::SystemTime};
 
 use bytes::BytesMut;
 use tokio::{
@@ -149,23 +149,29 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
         Command::Set {
             key,
             flags,
-            exptime: _, // TODO:
+            exptime,
             data,
             noreply: _, // TODO:
         } => {
             let mut store = store.lock().unwrap();
-            let item = Item::new(data, flags);
+            let item = Item::new(data, flags, exptime);
             store.insert(key, item);
             Response::Stored
         }
         Command::Get { keys } => {
             let store = store.lock().unwrap();
+            let now = SystemTime::now();
             let values = keys
                 .into_iter()
                 .filter_map(|key| {
-                    store
-                        .get(&key)
-                        .map(|item| (key, item.flags(), item.data().clone()))
+                    store.get(&key).and_then(|item| {
+                        let expired = item.expires_at().is_some_and(|t| now >= t);
+                        if expired {
+                            None
+                        } else {
+                            Some((key, item.flags(), item.data().clone()))
+                        }
+                    })
                 })
                 .collect();
 
