@@ -195,3 +195,261 @@ pub async fn process(socket: TcpStream, store: Store) -> io::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::panic;
+    use std::vec;
+    use tokio::io::{DuplexStream, ReadHalf, WriteHalf, duplex, split};
+
+    fn setup(
+        cap: usize,
+    ) -> (
+        Connection<ReadHalf<DuplexStream>, WriteHalf<DuplexStream>>,
+        DuplexStream,
+    ) {
+        let (server_end, client_end) = duplex(cap);
+        let (server_r, server_w) = split(server_end);
+        (Connection::new(server_r, server_w), client_end)
+    }
+
+    #[tokio::test]
+    async fn get_single_key() {
+        let (mut conn, mut client) = setup(1024);
+        client.write_all(b"get foo\r\n").await.unwrap();
+
+        match conn.read_command().await.unwrap() {
+            Some(Command::Get { keys }) => assert_eq!(keys, vec!["foo"]),
+            other => panic!("expected Get, got {:?}", other.is_some()),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_multiple_keys() {
+        let (mut conn, mut client) = setup(1024);
+        client.write_all(b"get foo bar baz\r\n").await.unwrap();
+
+        match conn.read_command().await.unwrap() {
+            Some(Command::Get { keys }) => assert_eq!(keys, vec!["foo", "bar", "baz"]),
+            _ => panic!("expected Get"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_with_no_keys_errors_and_resyncs() {
+        let (mut conn, mut client) = setup(1024);
+        client.write_all(b"get\r\n").await.unwrap();
+        client.write_all(b"get foo\r\n").await.unwrap();
+
+        match conn.read_command().await.unwrap() {
+            Some(Command::Get { keys }) => assert_eq!(keys, vec!["foo"]),
+            other => panic!(
+                "expected the second line to parse as Get, got {:?}",
+                other.is_some()
+            ),
+        }
+
+        let mut buf = [0u8; 32];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ERROR\r\n");
+    }
+
+    #[tokio::test]
+    async fn set_valid_command() {
+        let (mut conn, mut client) = setup(1024);
+        client
+            .write_all(b"set foo 42 3600 5\r\nhello\r\n")
+            .await
+            .unwrap();
+
+        match conn.read_command().await.unwrap() {
+            Some(Command::Set {
+                key,
+                flags,
+                exptime,
+                data,
+                noreply,
+            }) => {
+                assert_eq!(key, "foo");
+                assert_eq!(flags, 42);
+                assert_eq!(exptime, 3600);
+                assert_eq!(&data[..], b"hello");
+                assert!(!noreply);
+            }
+            _ => panic!("Expected Set"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_with_noreply() {
+        let (mut conn, mut client) = setup(1024);
+        client
+            .write_all(b"set foo 0 0 5 noreply\r\nhello\r\n")
+            .await
+            .unwrap();
+
+        match conn.read_command().await.unwrap() {
+            Some(Command::Set { noreply, .. }) => assert!(noreply),
+            _ => panic!("Expected Set with noreply"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_invalid_length_closes_connection() {
+        let (mut conn, mut client) = setup(1024);
+        client.write_all(b"set foo 0 0 bad\r\n").await.unwrap();
+
+        let cmd = conn.read_command().await.unwrap();
+        assert!(cmd.is_none(), "Connection should close on desync");
+
+        let mut buf = [0u8; 32];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ERROR\r\n");
+    }
+
+    #[tokio::test]
+    async fn set_invalid_flags_discards_data_and_resyncs() {
+        let (mut conn, mut client) = setup(1024);
+
+        client
+            .write_all(b"set foo bad 0 5\r\nhello\r\n")
+            .await
+            .unwrap();
+        client.write_all(b"get foo\r\n").await.unwrap();
+
+        match conn.read_command().await.unwrap() {
+            Some(Command::Get { keys }) => assert_eq!(keys, vec!["foo"]),
+            _ => panic!("Expected Get command after resync"),
+        }
+
+        let mut buf = [0u8; 32];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ERROR\r\n");
+    }
+
+    #[tokio::test]
+    async fn set_missing_trailing_crlf() {
+        let (mut conn, mut client) = setup(1024);
+
+        client
+            .write_all(b"set foo 0 0 5\r\nhello\n\n")
+            .await
+            .unwrap();
+        client.write_all(b"get foo\r\n").await.unwrap();
+
+        match conn.read_command().await.unwrap() {
+            Some(Command::Get { .. }) => {}
+            _ => panic!("Expected Get command after CRLF error recovery"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_trailing_garbage_errors_and_resyncs() {
+        let (mut conn, mut client) = setup(1024);
+        client
+            .write_all(b"set foo 0 0 5 garbage\r\nhello\r\n")
+            .await
+            .unwrap();
+        client.write_all(b"get bar\r\n").await.unwrap();
+
+        match conn.read_command().await.unwrap() {
+            Some(Command::Get { keys }) => assert_eq!(keys, vec!["bar"]),
+            other => panic!("stream desynced, got {:?}", other.is_some()),
+        }
+
+        let mut buf = [0u8; 32];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ERROR\r\n");
+    }
+
+    #[tokio::test]
+    async fn set_exceeds_max_item_size_discards_and_resyncs() {
+        let (mut conn, mut client) = setup(1024);
+        let payload_size = 1024 * 1024 + 1; // 1 MiB + 1 byte
+
+        let client_taks = tokio::spawn(async move {
+            let header = format!("set foo 0 0 {}\r\n", payload_size);
+            client.write_all(header.as_bytes()).await.unwrap();
+            client.write_all(&vec![b'A'; payload_size]).await.unwrap();
+            client.write_all(b"\r\n").await.unwrap();
+
+            client.write_all(b"get bar\r\n").await.unwrap();
+
+            let mut buf = [0u8; 32];
+            let n = client.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"ERROR\r\n");
+        });
+
+        match conn.read_command().await.unwrap() {
+            Some(Command::Get { keys }) => assert_eq!(keys, vec!["bar"]),
+            _ => panic!("Expected Get"),
+        }
+
+        client_taks.await.unwrap(); // propagate panic
+    }
+
+    #[tokio::test]
+    async fn delete_valid_command() {
+        let (mut conn, mut client) = setup(1024);
+        client.write_all(b"delete foo\r\n").await.unwrap();
+
+        match conn.read_command().await.unwrap() {
+            Some(Command::Delete { key, .. }) => assert_eq!(key, "foo"),
+            other => panic!("expected Delete, got {:?}", other.is_some()),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_with_noreply() {
+        let (mut conn, mut client) = setup(1024);
+        client.write_all(b"delete foo noreply\r\n").await.unwrap();
+
+        match conn.read_command().await.unwrap() {
+            Some(Command::Delete { noreply, .. }) => assert!(noreply),
+            _ => panic!("Expected Delete with noreply"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_trailing_garbage_errors_and_resyncs() {
+        let (mut conn, mut client) = setup(1024);
+        client.write_all(b"delete foo garbage\r\n").await.unwrap();
+        client.write_all(b"get bar\r\n").await.unwrap();
+
+        match conn.read_command().await.unwrap() {
+            Some(Command::Get { keys }) => assert_eq!(keys, vec!["bar"]),
+            other => panic!("stream desynced, got {:?}", other.is_some()),
+        }
+
+        let mut buf = [0u8; 32];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ERROR\r\n");
+    }
+
+    #[tokio::test]
+    async fn unknown_command_resyncs() {
+        let (mut conn, mut client) = setup(1024);
+
+        client.write_all(b"bar\r\n").await.unwrap();
+        client.write_all(b"get foo\r\n").await.unwrap();
+
+        match conn.read_command().await.unwrap() {
+            Some(Command::Get { keys }) => assert_eq!(keys, vec!["foo"]),
+            _ => panic!("Expected Get"),
+        }
+
+        let mut buf = [0u8; 32];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ERROR\r\n");
+    }
+
+    #[tokio::test]
+    async fn clean_client_disconnect() {
+        let (mut conn, client) = setup(1024);
+        drop(client);
+
+        let cmd = conn.read_command().await.unwrap();
+        assert!(cmd.is_none(), "Should gracefully return None on EOF");
+    }
+}
