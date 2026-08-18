@@ -46,6 +46,53 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                         keys: keys.iter().map(|s| s.to_string()).collect(),
                     }));
                 }
+                ["add", key, flags, exptime, bytes_len, rest @ ..] => {
+                    let Ok(bytes_len) = bytes_len.parse::<usize>() else {
+                        self.write_response(&Response::Error).await?;
+                        return Ok(None); // desync, must close
+                    };
+
+                    let (Ok(flags), Ok(exptime)) = (flags.parse(), exptime.parse()) else {
+                        self.discard_exact(bytes_len + 2).await?;
+                        self.write_response(&Response::Error).await?;
+                        continue;
+                    };
+
+                    if bytes_len > MAX_ITEM_SIZE {
+                        self.discard_exact(bytes_len + 2).await?;
+                        self.write_response(&Response::Error).await?;
+                        continue;
+                    }
+
+                    let noreply = match rest {
+                        [] => false,
+                        ["noreply"] => true,
+                        _ => {
+                            self.discard_exact(bytes_len + 2).await?;
+                            self.write_response(&Response::Error).await?;
+                            continue;
+                        }
+                    };
+
+                    let mut data = BytesMut::zeroed(bytes_len);
+                    self.reader.read_exact(&mut data).await?;
+                    let data = data.freeze();
+
+                    let mut crlf = [0u8; 2];
+                    self.reader.read_exact(&mut crlf).await?;
+                    if crlf != *b"\r\n" {
+                        self.write_response(&Response::Error).await?;
+                        continue;
+                    }
+
+                    return Ok(Some(Command::Add {
+                        key: key.to_string(),
+                        flags,
+                        exptime,
+                        data,
+                        noreply,
+                    }));
+                }
                 ["set", key, flags, exptime, bytes_len, rest @ ..] => {
                     let Ok(bytes_len) = bytes_len.parse::<usize>() else {
                         self.write_response(&Response::Error).await?;
@@ -146,6 +193,22 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
 
 pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
     match cmd {
+        Command::Add {
+            key,
+            flags,
+            exptime,
+            data,
+            noreply: _,
+        } => {
+            let mut store = store.write().unwrap();
+            if store.contains_key(&key) {
+                return Response::NotStored;
+            }
+
+            let item = Item::new(data, flags, exptime);
+            store.insert(key, item);
+            Response::Stored
+        }
         Command::Set {
             key,
             flags,

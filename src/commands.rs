@@ -12,6 +12,13 @@ pub enum Command {
         data: Bytes,
         noreply: bool,
     },
+    Add {
+        key: String,
+        flags: u32,
+        exptime: i64,
+        data: Bytes,
+        noreply: bool,
+    },
     Delete {
         key: String,
         noreply: bool,
@@ -24,7 +31,9 @@ impl Command {
     /// match on `Command` again just to find the flag.
     pub(crate) fn noreply(&self) -> bool {
         match self {
-            Command::Set { noreply, .. } | Command::Delete { noreply, .. } => *noreply,
+            Command::Set { noreply, .. }
+            | Command::Delete { noreply, .. }
+            | Command::Add { noreply, .. } => *noreply,
             Command::Get { .. } => false,
         }
     }
