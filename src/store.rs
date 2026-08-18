@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, RwLock},
     time::{Duration, SystemTime},
 };
 
@@ -47,4 +47,4 @@ impl Item {
 }
 
 /// Shared handle to the whole cache.
-pub type Store = Arc<Mutex<HashMap<String, Item>>>;
+pub type Store = Arc<RwLock<HashMap<String, Item>>>;

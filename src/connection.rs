@@ -151,34 +151,46 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
             flags,
             exptime,
             data,
-            noreply: _, // TODO:
+            noreply: _,
         } => {
-            let mut store = store.lock().unwrap();
+            let mut store = store.write().unwrap();
             let item = Item::new(data, flags, exptime);
             store.insert(key, item);
             Response::Stored
         }
         Command::Get { keys } => {
-            let store = store.lock().unwrap();
             let now = SystemTime::now();
-            let values = keys
-                .into_iter()
-                .filter_map(|key| {
-                    store.get(&key).and_then(|item| {
-                        let expired = item.expires_at().is_some_and(|t| now >= t);
-                        if expired {
-                            None
+            let mut expired_keys = Vec::new();
+            let mut values = Vec::new();
+
+            {
+                let store = store.read().unwrap();
+                for key in keys {
+                    if let Some(item) = store.get(&key) {
+                        if item.expires_at().is_some_and(|t| now >= t) {
+                            expired_keys.push(key);
                         } else {
-                            Some((key, item.flags(), item.data().clone()))
+                            values.push((key, item.flags(), item.data().clone()));
                         }
-                    })
-                })
-                .collect();
+                    }
+                }
+            }
+
+            if !expired_keys.is_empty() {
+                let mut store = store.write().unwrap();
+                for key in expired_keys {
+                    if let Some(item) = store.get(&key)
+                        && item.expires_at().is_some_and(|t| now >= t)
+                    {
+                        store.remove(&key);
+                    }
+                }
+            }
 
             Response::Values(values)
         }
         Command::Delete { key, noreply: _ } => {
-            let mut store = store.lock().unwrap();
+            let mut store = store.write().unwrap();
             match store.remove(&key) {
                 Some(_) => Response::Deleted,
                 None => Response::NotFound,
