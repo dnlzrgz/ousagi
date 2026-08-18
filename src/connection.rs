@@ -9,7 +9,7 @@ use tokio::{
 };
 
 use crate::{
-    commands::{Command, Response},
+    commands::{Command, Response, StoreArgs, StoreOp},
     store::{Item, Store},
 };
 
@@ -19,7 +19,6 @@ pub(crate) struct Connection<R, W> {
     line: String,
 }
 
-/// Default max item size.
 const MAX_ITEM_SIZE: usize = 1024 * 1024; // 1 MiB
 
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
@@ -46,10 +45,23 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                         keys: keys.iter().map(|s| s.to_string()).collect(),
                     }));
                 }
-                ["add", key, flags, exptime, bytes_len, rest @ ..] => {
+                [
+                    op @ ("add" | "set"),
+                    key,
+                    flags,
+                    exptime,
+                    bytes_len,
+                    rest @ ..,
+                ] => {
+                    let store_op = if *op == "add" {
+                        StoreOp::Add
+                    } else {
+                        StoreOp::Set
+                    };
+
                     let Ok(bytes_len) = bytes_len.parse::<usize>() else {
                         self.write_response(&Response::Error).await?;
-                        return Ok(None); // desync, must close
+                        return Ok(None);
                     };
 
                     let (Ok(flags), Ok(exptime)) = (flags.parse(), exptime.parse()) else {
@@ -64,16 +76,6 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                         continue;
                     }
 
-                    let noreply = match rest {
-                        [] => false,
-                        ["noreply"] => true,
-                        _ => {
-                            self.discard_exact(bytes_len + 2).await?;
-                            self.write_response(&Response::Error).await?;
-                            continue;
-                        }
-                    };
-
                     let mut data = BytesMut::zeroed(bytes_len);
                     self.reader.read_exact(&mut data).await?;
                     let data = data.freeze();
@@ -85,60 +87,26 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                         continue;
                     }
 
-                    return Ok(Some(Command::Add {
-                        key: key.to_string(),
-                        flags,
-                        exptime,
-                        data,
-                        noreply,
-                    }));
-                }
-                ["set", key, flags, exptime, bytes_len, rest @ ..] => {
-                    let Ok(bytes_len) = bytes_len.parse::<usize>() else {
-                        self.write_response(&Response::Error).await?;
-                        return Ok(None); // desync, must close
-                    };
-
-                    let (Ok(flags), Ok(exptime)) = (flags.parse(), exptime.parse()) else {
-                        self.discard_exact(bytes_len + 2).await?;
-                        self.write_response(&Response::Error).await?;
-                        continue;
-                    };
-
-                    if bytes_len > MAX_ITEM_SIZE {
-                        self.discard_exact(bytes_len + 2).await?;
-                        self.write_response(&Response::Error).await?;
-                        continue;
-                    }
-
                     let noreply = match rest {
                         [] => false,
                         ["noreply"] => true,
                         _ => {
-                            self.discard_exact(bytes_len + 2).await?;
+                            // Note: If parsing fails before payload bytes are read, respond with error and continue.
                             self.write_response(&Response::Error).await?;
                             continue;
                         }
                     };
 
-                    let mut data = BytesMut::zeroed(bytes_len);
-                    self.reader.read_exact(&mut data).await?;
-                    let data = data.freeze();
-
-                    let mut crlf = [0u8; 2];
-                    self.reader.read_exact(&mut crlf).await?;
-                    if crlf != *b"\r\n" {
-                        self.write_response(&Response::Error).await?;
-                        continue;
-                    }
-
-                    return Ok(Some(Command::Set {
-                        key: key.to_string(),
-                        flags,
-                        exptime,
-                        data,
-                        noreply,
-                    }));
+                    return Ok(Some(Command::Store(
+                        store_op,
+                        StoreArgs {
+                            key: key.to_string(),
+                            flags,
+                            exptime,
+                            data,
+                            noreply,
+                        },
+                    )));
                 }
                 ["delete", key, rest @ ..] => {
                     let noreply = match rest {
@@ -193,34 +161,6 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
 
 pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
     match cmd {
-        Command::Add {
-            key,
-            flags,
-            exptime,
-            data,
-            noreply: _,
-        } => {
-            let mut store = store.write().unwrap();
-            if store.contains_key(&key) {
-                return Response::NotStored;
-            }
-
-            let item = Item::new(data, flags, exptime);
-            store.insert(key, item);
-            Response::Stored
-        }
-        Command::Set {
-            key,
-            flags,
-            exptime,
-            data,
-            noreply: _,
-        } => {
-            let mut store = store.write().unwrap();
-            let item = Item::new(data, flags, exptime);
-            store.insert(key, item);
-            Response::Stored
-        }
         Command::Get { keys } => {
             let now = SystemTime::now();
             let mut expired_keys = Vec::new();
@@ -251,6 +191,16 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
             }
 
             Response::Values(values)
+        }
+        Command::Store(op, args) => {
+            let mut store = store.write().unwrap();
+            if op == StoreOp::Add && store.contains_key(&args.key) {
+                return Response::NotStored;
+            }
+
+            let item = Item::new(args.data, args.flags, args.exptime);
+            store.insert(args.key, item);
+            Response::Stored
         }
         Command::Delete { key, noreply: _ } => {
             let mut store = store.write().unwrap();
@@ -345,20 +295,14 @@ mod tests {
             .unwrap();
 
         match conn.read_command().await.unwrap() {
-            Some(Command::Set {
-                key,
-                flags,
-                exptime,
-                data,
-                noreply,
-            }) => {
-                assert_eq!(key, "foo");
-                assert_eq!(flags, 42);
-                assert_eq!(exptime, 3600);
-                assert_eq!(&data[..], b"hello");
-                assert!(!noreply);
+            Some(Command::Store(StoreOp::Set, args)) => {
+                assert_eq!(args.key, "foo");
+                assert_eq!(args.flags, 42);
+                assert_eq!(args.exptime, 3600);
+                assert_eq!(&args.data[..], b"hello");
+                assert!(!args.noreply);
             }
-            _ => panic!("Expected Set"),
+            _ => panic!("Expected Store(Set)"),
         }
     }
 
@@ -371,7 +315,7 @@ mod tests {
             .unwrap();
 
         match conn.read_command().await.unwrap() {
-            Some(Command::Set { noreply, .. }) => assert!(noreply),
+            Some(Command::Store(StoreOp::Set, args)) => assert!(args.noreply),
             _ => panic!("Expected Set with noreply"),
         }
     }

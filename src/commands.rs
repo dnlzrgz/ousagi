@@ -1,28 +1,23 @@
 use bytes::Bytes;
 
-/// A fully-parsed client request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreOp {
+    Set,
+    Add,
+}
+
+pub struct StoreArgs {
+    pub key: String,
+    pub flags: u32,
+    pub exptime: i64,
+    pub data: Bytes,
+    pub noreply: bool,
+}
+
 pub enum Command {
-    Get {
-        keys: Vec<String>,
-    },
-    Set {
-        key: String,
-        flags: u32,
-        exptime: i64,
-        data: Bytes,
-        noreply: bool,
-    },
-    Add {
-        key: String,
-        flags: u32,
-        exptime: i64,
-        data: Bytes,
-        noreply: bool,
-    },
-    Delete {
-        key: String,
-        noreply: bool,
-    },
+    Get { keys: Vec<String> },
+    Store(StoreOp, StoreArgs),
+    Delete { key: String, noreply: bool },
 }
 
 impl Command {
@@ -31,9 +26,8 @@ impl Command {
     /// match on `Command` again just to find the flag.
     pub(crate) fn noreply(&self) -> bool {
         match self {
-            Command::Set { noreply, .. }
-            | Command::Delete { noreply, .. }
-            | Command::Add { noreply, .. } => *noreply,
+            Command::Store(_, args) => args.noreply,
+            Command::Delete { noreply, .. } => *noreply,
             Command::Get { .. } => false,
         }
     }
