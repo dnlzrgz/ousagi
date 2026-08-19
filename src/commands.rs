@@ -5,6 +5,8 @@ pub enum StoreOp {
     Set,
     Add,
     Replace,
+    Append,
+    Prepend,
 }
 
 pub struct StoreArgs {

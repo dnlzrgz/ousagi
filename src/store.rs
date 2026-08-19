@@ -33,6 +33,14 @@ impl Item {
         }
     }
 
+    pub(crate) fn with_parts(data: Bytes, flags: u32, expires_at: Option<SystemTime>) -> Self {
+        Self {
+            data,
+            flags,
+            expires_at,
+        }
+    }
+
     pub(crate) fn data(&self) -> &Bytes {
         &self.data
     }

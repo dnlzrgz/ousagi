@@ -1,4 +1,4 @@
-use std::{collections::hash_map::Entry, f32::consts::E, io, time::SystemTime};
+use std::{collections::hash_map::Entry, io, time::SystemTime};
 
 use bytes::BytesMut;
 use tokio::{
@@ -46,7 +46,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                     }));
                 }
                 [
-                    op @ ("add" | "set" | "replace"),
+                    op @ ("add" | "set" | "replace" | "append" | "prepend"),
                     key,
                     flags,
                     exptime,
@@ -215,6 +215,29 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
                 StoreOp::Replace => match store.entry(args.key) {
                     Entry::Occupied(mut entry) if !entry.get().is_expired(now) => {
                         entry.insert(Item::new(args.data, args.flags, args.exptime));
+                        Response::Stored
+                    }
+                    _ => Response::NotStored,
+                },
+                StoreOp::Append | StoreOp::Prepend => match store.entry(args.key) {
+                    Entry::Occupied(mut entry) if !entry.get().is_expired(now) => {
+                        let old_item = entry.get();
+
+                        let mut new_data =
+                            BytesMut::with_capacity(old_item.data().len() + args.data.len());
+
+                        let (first, second) = if op == StoreOp::Append {
+                            (old_item.data(), &args.data)
+                        } else {
+                            (&args.data, old_item.data())
+                        };
+                        new_data.extend_from_slice(first);
+                        new_data.extend_from_slice(second);
+                        let new_data = new_data.freeze();
+
+                        let item =
+                            Item::with_parts(new_data, old_item.flags(), old_item.expires_at());
+                        entry.insert(item);
                         Response::Stored
                     }
                     _ => Response::NotStored,
