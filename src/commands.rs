@@ -4,6 +4,7 @@ use bytes::Bytes;
 pub enum StoreOp {
     Set,
     Add,
+    Replace,
 }
 
 pub struct StoreArgs {

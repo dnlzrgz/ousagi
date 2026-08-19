@@ -44,6 +44,10 @@ impl Item {
     pub(crate) fn expires_at(&self) -> Option<SystemTime> {
         self.expires_at
     }
+
+    pub(crate) fn is_expired(&self, now: SystemTime) -> bool {
+        self.expires_at.is_some_and(|t| now >= t)
+    }
 }
 
 /// Shared handle to the whole cache.

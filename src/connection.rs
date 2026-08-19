@@ -1,4 +1,4 @@
-use std::{io, time::SystemTime};
+use std::{collections::hash_map::Entry, f32::consts::E, io, time::SystemTime};
 
 use bytes::BytesMut;
 use tokio::{
@@ -46,17 +46,18 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                     }));
                 }
                 [
-                    op @ ("add" | "set"),
+                    op @ ("add" | "set" | "replace"),
                     key,
                     flags,
                     exptime,
                     bytes_len,
                     rest @ ..,
                 ] => {
-                    let store_op = if *op == "add" {
-                        StoreOp::Add
-                    } else {
-                        StoreOp::Set
+                    let store_op = match *op {
+                        "add" => StoreOp::Add,
+                        "replace" => StoreOp::Replace,
+                        "set" => StoreOp::Set,
+                        _ => unreachable!(),
                     };
 
                     let Ok(bytes_len) = bytes_len.parse::<usize>() else {
@@ -169,12 +170,10 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
             {
                 let store = store.read().unwrap();
                 for key in keys {
-                    if let Some(item) = store.get(&key) {
-                        if item.expires_at().is_some_and(|t| now >= t) {
-                            expired_keys.push(key);
-                        } else {
-                            values.push((key, item.flags(), item.data().clone()));
-                        }
+                    match store.get(&key) {
+                        Some(item) if item.is_expired(now) => expired_keys.push(key),
+                        Some(item) => values.push((key, item.flags(), item.data().clone())),
+                        _ => {}
                     }
                 }
             }
@@ -182,10 +181,10 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
             if !expired_keys.is_empty() {
                 let mut store = store.write().unwrap();
                 for key in expired_keys {
-                    if let Some(item) = store.get(&key)
-                        && item.expires_at().is_some_and(|t| now >= t)
+                    if let Entry::Occupied(entry) = store.entry(key)
+                        && entry.get().is_expired(now)
                     {
-                        store.remove(&key);
+                        entry.remove();
                     }
                 }
             }
@@ -193,14 +192,34 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
             Response::Values(values)
         }
         Command::Store(op, args) => {
+            let now = SystemTime::now();
             let mut store = store.write().unwrap();
-            if op == StoreOp::Add && store.contains_key(&args.key) {
-                return Response::NotStored;
-            }
 
-            let item = Item::new(args.data, args.flags, args.exptime);
-            store.insert(args.key, item);
-            Response::Stored
+            match op {
+                StoreOp::Add => match store.entry(args.key) {
+                    Entry::Occupied(entry) if !entry.get().is_expired(now) => Response::NotStored,
+                    Entry::Occupied(mut entry) => {
+                        entry.insert(Item::new(args.data, args.flags, args.exptime));
+                        Response::Stored
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(Item::new(args.data, args.flags, args.exptime));
+                        Response::Stored
+                    }
+                },
+                StoreOp::Set => {
+                    let item = Item::new(args.data, args.flags, args.exptime);
+                    store.insert(args.key, item);
+                    Response::Stored
+                }
+                StoreOp::Replace => match store.entry(args.key) {
+                    Entry::Occupied(mut entry) if !entry.get().is_expired(now) => {
+                        entry.insert(Item::new(args.data, args.flags, args.exptime));
+                        Response::Stored
+                    }
+                    _ => Response::NotStored,
+                },
+            }
         }
         Command::Delete { key, noreply: _ } => {
             let mut store = store.write().unwrap();
