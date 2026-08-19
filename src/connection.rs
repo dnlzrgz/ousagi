@@ -46,7 +46,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                     }));
                 }
                 [
-                    op @ ("add" | "set" | "replace" | "append" | "prepend"),
+                    op @ ("add" | "set" | "replace" | "append" | "prepend" | "cas"),
                     key,
                     flags,
                     exptime,
@@ -57,6 +57,9 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                         "add" => StoreOp::Add,
                         "replace" => StoreOp::Replace,
                         "set" => StoreOp::Set,
+                        "append" => StoreOp::Append,
+                        "prepend" => StoreOp::Prepend,
+                        "cas" => StoreOp::Cas,
                         _ => unreachable!(),
                     };
 
@@ -88,11 +91,28 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                         continue;
                     }
 
+                    let (cas, rest) = if store_op == StoreOp::Cas {
+                        match rest {
+                            [cas_unique, rest @ ..] => {
+                                let Ok(cas_unique) = cas_unique.parse::<u64>() else {
+                                    self.write_response(&Response::Error).await?;
+                                    continue;
+                                };
+                                (Some(cas_unique), rest)
+                            }
+                            [] => {
+                                self.write_response(&Response::Error).await?;
+                                continue;
+                            }
+                        }
+                    } else {
+                        (None, rest)
+                    };
+
                     let noreply = match rest {
                         [] => false,
                         ["noreply"] => true,
                         _ => {
-                            // Note: If parsing fails before payload bytes are read, respond with error and continue.
                             self.write_response(&Response::Error).await?;
                             continue;
                         }
@@ -106,6 +126,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                             exptime,
                             data,
                             noreply,
+                            cas,
                         },
                     )));
                 }
@@ -138,6 +159,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
             Response::NotStored => self.writer.write_all(b"NOT_STORED\r\n").await?,
             Response::Deleted => self.writer.write_all(b"DELETED\r\n").await?,
             Response::NotFound => self.writer.write_all(b"NOT_FOUND\r\n").await?,
+            Response::Exists => self.writer.write_all(b"EXISTS\r\n").await?,
             Response::Error => self.writer.write_all(b"ERROR\r\n").await?,
             Response::Values(values) => {
                 for (key, flags, data) in values {
@@ -170,7 +192,7 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
             {
                 let store = store.read().unwrap();
                 for key in keys {
-                    match store.get(&key) {
+                    match store.items.get(&key) {
                         Some(item) if item.is_expired(now) => expired_keys.push(key),
                         Some(item) => values.push((key, item.flags(), item.data().clone())),
                         _ => {}
@@ -181,7 +203,7 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
             if !expired_keys.is_empty() {
                 let mut store = store.write().unwrap();
                 for key in expired_keys {
-                    if let Entry::Occupied(entry) = store.entry(key)
+                    if let Entry::Occupied(entry) = store.items.entry(key)
                         && entry.get().is_expired(now)
                     {
                         entry.remove();
@@ -195,31 +217,34 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
             let now = SystemTime::now();
             let mut store = store.write().unwrap();
 
+            let cas = store.next_cas;
+            store.next_cas += 1;
+
             match op {
-                StoreOp::Add => match store.entry(args.key) {
+                StoreOp::Add => match store.items.entry(args.key) {
                     Entry::Occupied(entry) if !entry.get().is_expired(now) => Response::NotStored,
                     Entry::Occupied(mut entry) => {
-                        entry.insert(Item::new(args.data, args.flags, args.exptime));
+                        entry.insert(Item::new(args.data, args.flags, args.exptime, cas));
                         Response::Stored
                     }
                     Entry::Vacant(entry) => {
-                        entry.insert(Item::new(args.data, args.flags, args.exptime));
+                        entry.insert(Item::new(args.data, args.flags, args.exptime, cas));
                         Response::Stored
                     }
                 },
                 StoreOp::Set => {
-                    let item = Item::new(args.data, args.flags, args.exptime);
-                    store.insert(args.key, item);
+                    let item = Item::new(args.data, args.flags, args.exptime, cas);
+                    store.items.insert(args.key, item);
                     Response::Stored
                 }
-                StoreOp::Replace => match store.entry(args.key) {
+                StoreOp::Replace => match store.items.entry(args.key) {
                     Entry::Occupied(mut entry) if !entry.get().is_expired(now) => {
-                        entry.insert(Item::new(args.data, args.flags, args.exptime));
+                        entry.insert(Item::new(args.data, args.flags, args.exptime, cas));
                         Response::Stored
                     }
                     _ => Response::NotStored,
                 },
-                StoreOp::Append | StoreOp::Prepend => match store.entry(args.key) {
+                StoreOp::Append | StoreOp::Prepend => match store.items.entry(args.key) {
                     Entry::Occupied(mut entry) if !entry.get().is_expired(now) => {
                         let old_item = entry.get();
 
@@ -235,18 +260,33 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
                         new_data.extend_from_slice(second);
                         let new_data = new_data.freeze();
 
-                        let item =
-                            Item::with_parts(new_data, old_item.flags(), old_item.expires_at());
+                        let item = Item::with_parts(
+                            new_data,
+                            old_item.flags(),
+                            old_item.expires_at(),
+                            cas,
+                        );
                         entry.insert(item);
                         Response::Stored
                     }
                     _ => Response::NotStored,
                 },
+                StoreOp::Cas => match store.items.entry(args.key) {
+                    Entry::Occupied(mut entry) if !entry.get().is_expired(now) => {
+                        if entry.get().cas() != args.cas.unwrap() {
+                            return Response::Exists;
+                        }
+
+                        entry.insert(Item::new(args.data, args.flags, args.exptime, cas));
+                        Response::Stored
+                    }
+                    _ => Response::NotFound,
+                },
             }
         }
         Command::Delete { key, noreply: _ } => {
             let mut store = store.write().unwrap();
-            match store.remove(&key) {
+            match store.items.remove(&key) {
                 Some(_) => Response::Deleted,
                 None => Response::NotFound,
             }

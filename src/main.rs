@@ -1,9 +1,9 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock},
-};
+use std::sync::{Arc, RwLock};
 
-use ousagi::{connection, store::Store};
+use ousagi::{
+    connection,
+    store::{Store, StoreInner},
+};
 use tokio::net::TcpListener;
 
 #[tokio::main(flavor = "current_thread")]
@@ -11,7 +11,7 @@ async fn main() {
     let listener = TcpListener::bind("127.0.0.1:11211").await.unwrap();
     println!("listening on 127.0.0.1:11211");
 
-    let store: Store = Arc::new(RwLock::new(HashMap::new()));
+    let store: Store = Arc::new(RwLock::new(StoreInner::new()));
 
     loop {
         let (socket, addr) = listener.accept().await.unwrap();

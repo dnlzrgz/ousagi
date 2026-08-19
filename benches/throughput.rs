@@ -1,12 +1,14 @@
 use std::{
-    collections::HashMap,
     net::SocketAddr,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use ousagi::{connection, store::Store};
+use ousagi::{
+    connection,
+    store::{Store, StoreInner},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -34,7 +36,7 @@ fn runtime() -> Runtime {
 async fn spawn_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let store: Store = Arc::new(RwLock::new(HashMap::new()));
+    let store: Store = Arc::new(RwLock::new(StoreInner::new()));
 
     tokio::spawn(async move {
         loop {

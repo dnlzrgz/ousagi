@@ -7,6 +7,7 @@ pub enum StoreOp {
     Replace,
     Append,
     Prepend,
+    Cas,
 }
 
 pub struct StoreArgs {
@@ -15,6 +16,7 @@ pub struct StoreArgs {
     pub exptime: i64,
     pub data: Bytes,
     pub noreply: bool,
+    pub cas: Option<u64>,
 }
 
 pub enum Command {
@@ -42,6 +44,7 @@ pub enum Response {
     NotStored,
     Deleted,
     NotFound,
+    Exists,
     Values(Vec<(String, u32, Bytes)>),
     Error,
 }

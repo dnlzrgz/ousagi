@@ -13,10 +13,11 @@ pub struct Item {
     data: Bytes,
     flags: u32,
     expires_at: Option<SystemTime>,
+    cas: u64,
 }
 
 impl Item {
-    pub(crate) fn new(data: Bytes, flags: u32, exptime: i64) -> Self {
+    pub(crate) fn new(data: Bytes, flags: u32, exptime: i64, cas: u64) -> Self {
         let expires_at = match exptime {
             0 => None,
             n if n < 0 => Some(SystemTime::UNIX_EPOCH),
@@ -30,14 +31,21 @@ impl Item {
             data,
             flags,
             expires_at,
+            cas,
         }
     }
 
-    pub(crate) fn with_parts(data: Bytes, flags: u32, expires_at: Option<SystemTime>) -> Self {
+    pub(crate) fn with_parts(
+        data: Bytes,
+        flags: u32,
+        expires_at: Option<SystemTime>,
+        cas: u64,
+    ) -> Self {
         Self {
             data,
             flags,
             expires_at,
+            cas,
         }
     }
 
@@ -49,6 +57,10 @@ impl Item {
         self.flags
     }
 
+    pub(crate) fn cas(&self) -> u64 {
+        self.cas
+    }
+
     pub(crate) fn expires_at(&self) -> Option<SystemTime> {
         self.expires_at
     }
@@ -58,5 +70,17 @@ impl Item {
     }
 }
 
+#[derive(Default)]
+pub struct StoreInner {
+    pub items: HashMap<String, Item>,
+    pub next_cas: u64,
+}
+
+impl StoreInner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// Shared handle to the whole cache.
-pub type Store = Arc<RwLock<HashMap<String, Item>>>;
+pub type Store = Arc<RwLock<StoreInner>>;
