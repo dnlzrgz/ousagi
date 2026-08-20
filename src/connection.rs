@@ -40,9 +40,11 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
 
             let parts: Vec<&str> = self.line.split_whitespace().collect();
             match parts.as_slice() {
-                ["get", keys @ ..] if !keys.is_empty() => {
+                [op @ ("get" | "gets"), keys @ ..] if !keys.is_empty() => {
+                    let with_cas = *op == "gets";
                     return Ok(Some(Command::Get {
                         keys: keys.iter().map(|s| s.to_string()).collect(),
+                        with_cas,
                     }));
                 }
                 [
@@ -64,17 +66,20 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                     };
 
                     let Ok(bytes_len) = bytes_len.parse::<usize>() else {
+                        tracing::warn!(line = %self.line.trim_end(), "malformed byte length");
                         self.write_response(&Response::Error).await?;
                         return Ok(None);
                     };
 
                     let (Ok(flags), Ok(exptime)) = (flags.parse(), exptime.parse()) else {
+                        tracing::warn!(line = %self.line.trim_end(), "malformed flags/exptime");
                         self.discard_exact(bytes_len + 2).await?;
                         self.write_response(&Response::Error).await?;
                         continue;
                     };
 
                     if bytes_len > MAX_ITEM_SIZE {
+                        tracing::warn!(bytes_len, max = MAX_ITEM_SIZE, "item exceeds max size");
                         self.discard_exact(bytes_len + 2).await?;
                         self.write_response(&Response::Error).await?;
                         continue;
@@ -87,6 +92,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                     let mut crlf = [0u8; 2];
                     self.reader.read_exact(&mut crlf).await?;
                     if crlf != *b"\r\n" {
+                        tracing::warn!("missing trailing CRLF after data block");
                         self.write_response(&Response::Error).await?;
                         continue;
                     }
@@ -146,6 +152,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                     }));
                 }
                 _ => {
+                    tracing::warn!(line = %self.line.trim_end(), "unrecognized command");
                     self.write_response(&Response::Error).await?;
                     continue;
                 }
@@ -162,8 +169,11 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
             Response::Exists => self.writer.write_all(b"EXISTS\r\n").await?,
             Response::Error => self.writer.write_all(b"ERROR\r\n").await?,
             Response::Values(values) => {
-                for (key, flags, data) in values {
-                    let header = format!("VALUE {key} {flags} {}\r\n", data.len());
+                for (key, flags, data, cas) in values {
+                    let header = match cas {
+                        Some(cas) => format!("VALUE {key} {flags} {} {cas}\r\n", data.len()),
+                        None => format!("VALUE {key} {flags} {}\r\n", data.len()),
+                    };
                     self.writer.write_all(header.as_bytes()).await?;
                     self.writer.write_all(data).await?;
                     self.writer.write_all(b"\r\n").await?;
@@ -184,7 +194,9 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
 
 pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
     match cmd {
-        Command::Get { keys } => {
+        Command::Get { keys, with_cas } => {
+            tracing::debug!(?keys, with_cas, "get");
+
             let now = SystemTime::now();
             let mut expired_keys = Vec::new();
             let mut values = Vec::new();
@@ -194,7 +206,10 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
                 for key in keys {
                     match store.items.get(&key) {
                         Some(item) if item.is_expired(now) => expired_keys.push(key),
-                        Some(item) => values.push((key, item.flags(), item.data().clone())),
+                        Some(item) => {
+                            let cas = if with_cas { Some(item.cas()) } else { None };
+                            values.push((key, item.flags(), item.data().clone(), cas));
+                        }
                         _ => {}
                     }
                 }
@@ -214,6 +229,8 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
             Response::Values(values)
         }
         Command::Store(op, args) => {
+            tracing::debug!(?op, key = %args.key, len = args.data.len(), exptime = args.exptime, "store");
+
             let now = SystemTime::now();
             let mut store = store.write().unwrap();
 
@@ -274,6 +291,12 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
                 StoreOp::Cas => match store.items.entry(args.key) {
                     Entry::Occupied(mut entry) if !entry.get().is_expired(now) => {
                         if entry.get().cas() != args.cas.unwrap() {
+                            tracing::debug!(
+                                expected = args.cas.unwrap(),
+                                actual = entry.get().cas(),
+                                "cas mismatch"
+                            );
+
                             return Response::Exists;
                         }
 
@@ -285,6 +308,8 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
             }
         }
         Command::Delete { key, noreply: _ } => {
+            tracing::debug!(%key, "delete");
+
             let mut store = store.write().unwrap();
             match store.items.remove(&key) {
                 Some(_) => Response::Deleted,
@@ -333,7 +358,7 @@ mod tests {
         client.write_all(b"get foo\r\n").await.unwrap();
 
         match conn.read_command().await.unwrap() {
-            Some(Command::Get { keys }) => assert_eq!(keys, vec!["foo"]),
+            Some(Command::Get { keys, .. }) => assert_eq!(keys, vec!["foo"]),
             other => panic!("expected Get, got {:?}", other.is_some()),
         }
     }
@@ -344,7 +369,7 @@ mod tests {
         client.write_all(b"get foo bar baz\r\n").await.unwrap();
 
         match conn.read_command().await.unwrap() {
-            Some(Command::Get { keys }) => assert_eq!(keys, vec!["foo", "bar", "baz"]),
+            Some(Command::Get { keys, .. }) => assert_eq!(keys, vec!["foo", "bar", "baz"]),
             _ => panic!("expected Get"),
         }
     }
@@ -356,7 +381,7 @@ mod tests {
         client.write_all(b"get foo\r\n").await.unwrap();
 
         match conn.read_command().await.unwrap() {
-            Some(Command::Get { keys }) => assert_eq!(keys, vec!["foo"]),
+            Some(Command::Get { keys, .. }) => assert_eq!(keys, vec!["foo"]),
             other => panic!(
                 "expected the second line to parse as Get, got {:?}",
                 other.is_some()
@@ -426,7 +451,7 @@ mod tests {
         client.write_all(b"get foo\r\n").await.unwrap();
 
         match conn.read_command().await.unwrap() {
-            Some(Command::Get { keys }) => assert_eq!(keys, vec!["foo"]),
+            Some(Command::Get { keys, .. }) => assert_eq!(keys, vec!["foo"]),
             _ => panic!("Expected Get command after resync"),
         }
 
@@ -461,7 +486,7 @@ mod tests {
         client.write_all(b"get bar\r\n").await.unwrap();
 
         match conn.read_command().await.unwrap() {
-            Some(Command::Get { keys }) => assert_eq!(keys, vec!["bar"]),
+            Some(Command::Get { keys, .. }) => assert_eq!(keys, vec!["bar"]),
             other => panic!("stream desynced, got {:?}", other.is_some()),
         }
 
@@ -489,7 +514,7 @@ mod tests {
         });
 
         match conn.read_command().await.unwrap() {
-            Some(Command::Get { keys }) => assert_eq!(keys, vec!["bar"]),
+            Some(Command::Get { keys, .. }) => assert_eq!(keys, vec!["bar"]),
             _ => panic!("Expected Get"),
         }
 
@@ -525,7 +550,7 @@ mod tests {
         client.write_all(b"get bar\r\n").await.unwrap();
 
         match conn.read_command().await.unwrap() {
-            Some(Command::Get { keys }) => assert_eq!(keys, vec!["bar"]),
+            Some(Command::Get { keys, .. }) => assert_eq!(keys, vec!["bar"]),
             other => panic!("stream desynced, got {:?}", other.is_some()),
         }
 
@@ -542,7 +567,7 @@ mod tests {
         client.write_all(b"get foo\r\n").await.unwrap();
 
         match conn.read_command().await.unwrap() {
-            Some(Command::Get { keys }) => assert_eq!(keys, vec!["foo"]),
+            Some(Command::Get { keys, .. }) => assert_eq!(keys, vec!["foo"]),
             _ => panic!("Expected Get"),
         }
 

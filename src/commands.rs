@@ -20,7 +20,7 @@ pub struct StoreArgs {
 }
 
 pub enum Command {
-    Get { keys: Vec<String> },
+    Get { keys: Vec<String>, with_cas: bool },
     Store(StoreOp, StoreArgs),
     Delete { key: String, noreply: bool },
 }
@@ -45,6 +45,6 @@ pub enum Response {
     Deleted,
     NotFound,
     Exists,
-    Values(Vec<(String, u32, Bytes)>),
+    Values(Vec<(String, u32, Bytes, Option<u64>)>),
     Error,
 }

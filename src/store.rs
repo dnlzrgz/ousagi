@@ -78,7 +78,10 @@ pub struct StoreInner {
 
 impl StoreInner {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            next_cas: 1,
+            ..Default::default()
+        }
     }
 }
 
