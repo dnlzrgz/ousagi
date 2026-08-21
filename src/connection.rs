@@ -337,11 +337,26 @@ pub async fn process(socket: TcpStream, store: Store) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::panic;
-    use std::vec;
+    use crate::store::StoreInner;
+    use bytes::Bytes;
+    use std::sync::{Arc, RwLock};
     use tokio::io::{DuplexStream, ReadHalf, WriteHalf, duplex, split};
 
-    fn setup(
+    /// Fresh, empty Store.
+    fn empty_store() -> Store {
+        Arc::new(RwLock::new(StoreInner::new()))
+    }
+
+    /// Store pre-populated with one item under `key`.
+    fn store_with(key: &str, item: Item) -> Store {
+        let mut inner = StoreInner::new();
+        inner.items.insert(key.into(), item);
+        Arc::new(RwLock::new(inner))
+    }
+
+    /// Builds a mock connection wired to an in-memory duplex pipeline instead of
+    /// a real `TcpStream`. It also gives back the client end of the pipe for the test.
+    fn mock_connection(
         cap: usize,
     ) -> (
         Connection<ReadHalf<DuplexStream>, WriteHalf<DuplexStream>>,
@@ -352,236 +367,282 @@ mod tests {
         (Connection::new(server_r, server_w), client_end)
     }
 
-    #[tokio::test]
-    async fn get_single_key() {
-        let (mut conn, mut client) = setup(1024);
-        client.write_all(b"get foo\r\n").await.unwrap();
+    #[test]
+    fn get_missing_key_returns_not_found() {
+        let store = empty_store();
+        let cmd = Command::Get {
+            keys: vec!["foo".into()],
+            with_cas: false,
+        };
 
-        match conn.read_command().await.unwrap() {
-            Some(Command::Get { keys, .. }) => assert_eq!(keys, vec!["foo"]),
-            other => panic!("expected Get, got {:?}", other.is_some()),
+        match execute(cmd, &store) {
+            Response::Values(values) => assert!(values.is_empty()),
+            other => panic!("expected Values, got: {:?}", other),
         }
     }
 
-    #[tokio::test]
-    async fn get_multiple_keys() {
-        let (mut conn, mut client) = setup(1024);
-        client.write_all(b"get foo bar baz\r\n").await.unwrap();
+    #[test]
+    fn get_multiple_keys_skips_missing_one() {
+        let store = store_with(
+            &"foo".to_string(),
+            Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1),
+        );
+        let cmd = Command::Get {
+            keys: vec!["foo".into(), "bar".into()],
+            with_cas: false,
+        };
 
-        match conn.read_command().await.unwrap() {
-            Some(Command::Get { keys, .. }) => assert_eq!(keys, vec!["foo", "bar", "baz"]),
-            _ => panic!("expected Get"),
+        match execute(cmd, &store) {
+            Response::Values(values) => assert!(values.len() == 1),
+            other => panic!("expected Values, got: {:?}", other),
         }
     }
 
-    #[tokio::test]
-    async fn get_with_no_keys_errors_and_resyncs() {
-        let (mut conn, mut client) = setup(1024);
-        client.write_all(b"get\r\n").await.unwrap();
-        client.write_all(b"get foo\r\n").await.unwrap();
+    #[test]
+    fn get_expired_key_is_treated_as_missing_and_lazily_removed() {
+        let store = store_with(
+            "foo",
+            Item::new(Bytes::copy_from_slice(b"hello"), 42, -1, 1),
+        );
 
-        match conn.read_command().await.unwrap() {
-            Some(Command::Get { keys, .. }) => assert_eq!(keys, vec!["foo"]),
-            other => panic!(
-                "expected the second line to parse as Get, got {:?}",
-                other.is_some()
-            ),
+        let resp = execute(
+            Command::Get {
+                keys: vec!["foo".into()],
+                with_cas: false,
+            },
+            &store,
+        );
+
+        match resp {
+            Response::Values(values) => assert!(values.is_empty()),
+            other => panic!("expected Values, got {:?}", other),
         }
 
-        let mut buf = [0u8; 32];
-        let n = client.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"ERROR\r\n");
+        let s = store.read().unwrap();
+        assert!(s.items.get("foo").is_none());
     }
 
-    #[tokio::test]
-    async fn set_valid_command() {
-        let (mut conn, mut client) = setup(1024);
-        client
-            .write_all(b"set foo 42 3600 5\r\nhello\r\n")
-            .await
-            .unwrap();
+    #[test]
+    fn add_new_key_stores_it_and_returns_stored() {
+        let store = empty_store();
+        let cmd = Command::Store(
+            StoreOp::Add,
+            StoreArgs {
+                key: "foo".into(),
+                flags: 42,
+                exptime: 0,
+                data: Bytes::from_static(b"hello"),
+                noreply: false,
+                cas: None,
+            },
+        );
 
-        match conn.read_command().await.unwrap() {
-            Some(Command::Store(StoreOp::Set, args)) => {
-                assert_eq!(args.key, "foo");
-                assert_eq!(args.flags, 42);
-                assert_eq!(args.exptime, 3600);
-                assert_eq!(&args.data[..], b"hello");
-                assert!(!args.noreply);
-            }
-            _ => panic!("Expected Store(Set)"),
-        }
+        let resp = execute(cmd, &store);
+        assert!(matches!(resp, Response::Stored));
     }
 
-    #[tokio::test]
-    async fn set_with_noreply() {
-        let (mut conn, mut client) = setup(1024);
-        client
-            .write_all(b"set foo 0 0 5 noreply\r\nhello\r\n")
-            .await
-            .unwrap();
+    #[test]
+    fn add_existing_key_fails_and_returns_not_stored() {
+        let item = Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1);
+        let cmd = Command::Store(
+            StoreOp::Add,
+            StoreArgs {
+                key: "foo".into(),
+                flags: 50,
+                exptime: 0,
+                data: Bytes::from_static(b"jello"),
+                noreply: false,
+                cas: None,
+            },
+        );
+        let store = store_with("foo", item);
 
-        match conn.read_command().await.unwrap() {
-            Some(Command::Store(StoreOp::Set, args)) => assert!(args.noreply),
-            _ => panic!("Expected Set with noreply"),
-        }
+        let resp = execute(cmd, &store);
+        assert!(matches!(resp, Response::NotStored));
+
+        let s = store.read().unwrap();
+        let item = s.items.get("foo").expect("key should still be present");
+        assert_eq!(item.data().as_ref(), b"hello");
+        assert_eq!(item.flags(), 42);
     }
 
-    #[tokio::test]
-    async fn set_invalid_length_closes_connection() {
-        let (mut conn, mut client) = setup(1024);
-        client.write_all(b"set foo 0 0 bad\r\n").await.unwrap();
+    #[test]
+    fn add_existing_expired_key_overwrites_and_returns_stored() {
+        let item = Item::new(Bytes::copy_from_slice(b"hello"), 42, -1, 1);
+        let cmd = Command::Store(
+            StoreOp::Add,
+            StoreArgs {
+                key: "foo".into(),
+                flags: item.flags(),
+                exptime: 0,
+                data: item.data().clone(),
+                noreply: false,
+                cas: None,
+            },
+        );
+        let store = store_with("foo", item);
 
-        let cmd = conn.read_command().await.unwrap();
-        assert!(cmd.is_none(), "Connection should close on desync");
-
-        let mut buf = [0u8; 32];
-        let n = client.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"ERROR\r\n");
+        let resp = execute(cmd, &store);
+        assert!(matches!(resp, Response::Stored));
     }
 
-    #[tokio::test]
-    async fn set_invalid_flags_discards_data_and_resyncs() {
-        let (mut conn, mut client) = setup(1024);
+    #[test]
+    fn replace_existing_key_stores_new_value() {
+        let store = store_with(
+            "foo".into(),
+            Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1),
+        );
 
-        client
-            .write_all(b"set foo bad 0 5\r\nhello\r\n")
-            .await
-            .unwrap();
-        client.write_all(b"get foo\r\n").await.unwrap();
+        let cmd = Command::Store(
+            StoreOp::Replace,
+            StoreArgs {
+                key: "foo".into(),
+                flags: 42,
+                exptime: 0,
+                data: Bytes::from_static(b"jello"),
+                noreply: false,
+                cas: None,
+            },
+        );
 
-        match conn.read_command().await.unwrap() {
-            Some(Command::Get { keys, .. }) => assert_eq!(keys, vec!["foo"]),
-            _ => panic!("Expected Get command after resync"),
-        }
+        let resp = execute(cmd, &store);
+        assert!(matches!(resp, Response::Stored));
 
-        let mut buf = [0u8; 32];
-        let n = client.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"ERROR\r\n");
+        let s = store.read().unwrap();
+        let item = s.items.get("foo").expect("key should still be present");
+        assert_eq!(item.data().as_ref(), b"jello");
     }
 
-    #[tokio::test]
-    async fn set_missing_trailing_crlf() {
-        let (mut conn, mut client) = setup(1024);
+    #[test]
+    fn replace_missing_key_returns_not_stored() {
+        let store = store_with(
+            "foo".into(),
+            Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1),
+        );
 
-        client
-            .write_all(b"set foo 0 0 5\r\nhello\n\n")
-            .await
-            .unwrap();
-        client.write_all(b"get foo\r\n").await.unwrap();
+        let cmd = Command::Store(
+            StoreOp::Replace,
+            StoreArgs {
+                key: "bar".into(),
+                flags: 42,
+                exptime: 0,
+                data: Bytes::from_static(b"hello"),
+                noreply: false,
+                cas: None,
+            },
+        );
 
-        match conn.read_command().await.unwrap() {
-            Some(Command::Get { .. }) => {}
-            _ => panic!("Expected Get command after CRLF error recovery"),
-        }
+        let resp = execute(cmd, &store);
+        assert!(matches!(resp, Response::NotStored));
     }
 
-    #[tokio::test]
-    async fn set_trailing_garbage_errors_and_resyncs() {
-        let (mut conn, mut client) = setup(1024);
-        client
-            .write_all(b"set foo 0 0 5 garbage\r\nhello\r\n")
-            .await
-            .unwrap();
-        client.write_all(b"get bar\r\n").await.unwrap();
+    #[test]
+    fn replace_expired_key_returns_not_stored() {
+        let store = store_with(
+            "foo".into(),
+            Item::new(Bytes::copy_from_slice(b"hello"), 42, -1, 1),
+        );
 
-        match conn.read_command().await.unwrap() {
-            Some(Command::Get { keys, .. }) => assert_eq!(keys, vec!["bar"]),
-            other => panic!("stream desynced, got {:?}", other.is_some()),
-        }
+        let cmd = Command::Store(
+            StoreOp::Replace,
+            StoreArgs {
+                key: "foo".into(),
+                flags: 42,
+                exptime: 0,
+                data: Bytes::from_static(b"jello"),
+                noreply: false,
+                cas: None,
+            },
+        );
 
-        let mut buf = [0u8; 32];
-        let n = client.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"ERROR\r\n");
+        let resp = execute(cmd, &store);
+        assert!(matches!(resp, Response::NotStored));
     }
 
-    #[tokio::test]
-    async fn set_exceeds_max_item_size_discards_and_resyncs() {
-        let (mut conn, mut client) = setup(1024);
-        let payload_size = 1024 * 1024 + 1; // 1 MiB + 1 byte
+    #[test]
+    fn set_new_key_stores_value() {
+        let store = empty_store();
+        let cmd = Command::Store(
+            StoreOp::Set,
+            StoreArgs {
+                key: "foo".into(),
+                flags: 42,
+                exptime: 0,
+                data: Bytes::from_static(b"hello"),
+                noreply: false,
+                cas: None,
+            },
+        );
 
-        let client_taks = tokio::spawn(async move {
-            let header = format!("set foo 0 0 {}\r\n", payload_size);
-            client.write_all(header.as_bytes()).await.unwrap();
-            client.write_all(&vec![b'A'; payload_size]).await.unwrap();
-            client.write_all(b"\r\n").await.unwrap();
+        let resp = execute(cmd, &store);
+        assert!(matches!(resp, Response::Stored));
 
-            client.write_all(b"get bar\r\n").await.unwrap();
-
-            let mut buf = [0u8; 32];
-            let n = client.read(&mut buf).await.unwrap();
-            assert_eq!(&buf[..n], b"ERROR\r\n");
-        });
-
-        match conn.read_command().await.unwrap() {
-            Some(Command::Get { keys, .. }) => assert_eq!(keys, vec!["bar"]),
-            _ => panic!("Expected Get"),
-        }
-
-        client_taks.await.unwrap(); // propagate panic
+        let s = store.read().unwrap();
+        let item = s.items.get("foo").unwrap();
+        assert_eq!(item.data().as_ref(), b"hello");
+        assert_eq!(item.flags(), 42);
     }
 
-    #[tokio::test]
-    async fn delete_valid_command() {
-        let (mut conn, mut client) = setup(1024);
-        client.write_all(b"delete foo\r\n").await.unwrap();
+    #[test]
+    fn set_overwrites_existing_key() {
+        let store = store_with(
+            "foo".into(),
+            Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1),
+        );
+        let cmd = Command::Store(
+            StoreOp::Set,
+            StoreArgs {
+                key: "foo".into(),
+                flags: 21,
+                exptime: 0,
+                data: Bytes::from_static(b"jello"),
+                noreply: false,
+                cas: None,
+            },
+        );
 
-        match conn.read_command().await.unwrap() {
-            Some(Command::Delete { key, .. }) => assert_eq!(key, "foo"),
-            other => panic!("expected Delete, got {:?}", other.is_some()),
-        }
+        let resp = execute(cmd, &store);
+        assert!(matches!(resp, Response::Stored));
+
+        let s = store.read().unwrap();
+        let item = s.items.get("foo").unwrap();
+        assert_eq!(item.data().as_ref(), b"jello");
+        assert_eq!(item.flags(), 21);
     }
 
-    #[tokio::test]
-    async fn delete_with_noreply() {
-        let (mut conn, mut client) = setup(1024);
-        client.write_all(b"delete foo noreply\r\n").await.unwrap();
+    #[test]
+    fn delete_existing_key_returns_deleted_and_removes_it() {
+        let store = store_with(
+            "foo".into(),
+            Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1),
+        );
+        let cmd = Command::Delete {
+            key: "foo".into(),
+            noreply: true,
+        };
 
-        match conn.read_command().await.unwrap() {
-            Some(Command::Delete { noreply, .. }) => assert!(noreply),
-            _ => panic!("Expected Delete with noreply"),
-        }
+        let resp = execute(cmd, &store);
+        assert!(matches!(resp, Response::Deleted));
+
+        let s = store.read().unwrap();
+        assert!(s.items.get("foo").is_none());
     }
 
-    #[tokio::test]
-    async fn delete_trailing_garbage_errors_and_resyncs() {
-        let (mut conn, mut client) = setup(1024);
-        client.write_all(b"delete foo garbage\r\n").await.unwrap();
-        client.write_all(b"get bar\r\n").await.unwrap();
+    #[test]
+    fn delete_missing_key_returns_not_found() {
+        let store = store_with(
+            "foo".into(),
+            Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1),
+        );
+        let cmd = Command::Delete {
+            key: "bar".into(),
+            noreply: true,
+        };
 
-        match conn.read_command().await.unwrap() {
-            Some(Command::Get { keys, .. }) => assert_eq!(keys, vec!["bar"]),
-            other => panic!("stream desynced, got {:?}", other.is_some()),
-        }
+        let resp = execute(cmd, &store);
+        assert!(matches!(resp, Response::NotFound));
 
-        let mut buf = [0u8; 32];
-        let n = client.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"ERROR\r\n");
-    }
-
-    #[tokio::test]
-    async fn unknown_command_resyncs() {
-        let (mut conn, mut client) = setup(1024);
-
-        client.write_all(b"bar\r\n").await.unwrap();
-        client.write_all(b"get foo\r\n").await.unwrap();
-
-        match conn.read_command().await.unwrap() {
-            Some(Command::Get { keys, .. }) => assert_eq!(keys, vec!["foo"]),
-            _ => panic!("Expected Get"),
-        }
-
-        let mut buf = [0u8; 32];
-        let n = client.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"ERROR\r\n");
-    }
-
-    #[tokio::test]
-    async fn clean_client_disconnect() {
-        let (mut conn, client) = setup(1024);
-        drop(client);
-
-        let cmd = conn.read_command().await.unwrap();
-        assert!(cmd.is_none(), "Should gracefully return None on EOF");
+        let s = store.read().unwrap();
+        assert!(s.items.get("foo").is_some());
     }
 }

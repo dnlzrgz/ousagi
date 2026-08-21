@@ -39,6 +39,7 @@ impl Command {
 }
 
 /// Response written back to the client for a given `Command`.
+#[derive(Debug)]
 pub enum Response {
     Stored,
     NotStored,
