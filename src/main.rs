@@ -25,7 +25,7 @@ pub struct Args {
     #[arg(short = 't', long, default_value_t = 4, value_parser = parse_threads)]
     pub threads: usize,
 
-    /// Be verbose during the event loop; print errors and warnings.
+    /// Verbosity level
     #[arg(short = 'v', action = ArgAction::Count)]
     pub verbose: u8,
 }
@@ -38,25 +38,15 @@ fn resolve_addr(args: &Args) -> SocketAddr {
 }
 
 fn parse_threads(s: &str) -> Result<usize, String> {
-    let n: usize = s
+    let threads: usize = s
         .parse()
         .map_err(|_| format!("'{s}' isn't a valid number"))?;
 
-    if n == 0 {
+    if threads == 0 {
         return Err("thread count must be at least 1".to_string());
     }
 
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let max = cores * 4;
-    if n > max {
-        return Err(format!(
-            "thread count {n} exceeds limit of {max} ({cores} cores available)"
-        ));
-    }
-
-    Ok(n)
+    Ok(threads)
 }
 
 fn verbosity_level(v: u8) -> &'static str {
@@ -77,18 +67,7 @@ fn main() {
         )
         .init();
 
-    let rt = if args.threads <= 1 {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-    } else {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(args.threads)
-            .enable_all()
-            .build()
-    }
-    .expect("failed to build tokio runtime");
-
+    let rt = ousagi::runtime::build(args.threads);
     rt.block_on(run(args));
 }
 
