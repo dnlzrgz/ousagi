@@ -11,7 +11,7 @@ pub enum StoreOp {
 }
 
 pub struct StoreArgs {
-    pub key: String,
+    pub key: Bytes,
     pub flags: u32,
     pub exptime: i64,
     pub data: Bytes,
@@ -20,9 +20,9 @@ pub struct StoreArgs {
 }
 
 pub enum Command {
-    Get { keys: Vec<String>, with_cas: bool },
+    Get { keys: Vec<Bytes>, with_cas: bool },
     Store(StoreOp, StoreArgs),
-    Delete { key: String, noreply: bool },
+    Delete { key: Bytes, noreply: bool },
 }
 
 impl Command {
@@ -46,6 +46,6 @@ pub enum Response {
     Deleted,
     NotFound,
     Exists,
-    Values(Vec<(String, u32, Bytes, Option<u64>)>),
+    Values(Vec<(Bytes, u32, Bytes, Option<u64>)>),
     Error,
 }

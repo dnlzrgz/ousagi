@@ -1,6 +1,6 @@
 use std::{collections::hash_map::Entry, io, time::SystemTime};
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use tokio::{
     io::{
         AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
@@ -16,39 +16,89 @@ use crate::{
 pub(crate) struct Connection<R, W> {
     reader: BufReader<R>,
     writer: BufWriter<W>,
-    line: String,
+    line: Vec<u8>,
 }
 
 const MAX_ITEM_SIZE: usize = 1024 * 1024; // 1 MiB
+const MAX_KEY_LEN: usize = 250;
+
+fn validate_key(key: &[u8]) -> Result<(), ()> {
+    if key.is_empty() || key.len() > MAX_KEY_LEN {
+        return Err(());
+    }
+
+    if key.iter().any(|&b| b <= 0x20 || b == 0x7F) {
+        return Err(());
+    }
+
+    Ok(())
+}
+
+fn parse_field<T: std::str::FromStr>(tok: &[u8]) -> Result<T, ()> {
+    std::str::from_utf8(tok)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or(())
+}
 
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
     fn new(reader: R, writer: W) -> Self {
         Connection {
             reader: BufReader::new(reader),
             writer: BufWriter::new(writer),
-            line: String::new(),
+            line: Vec::new(),
         }
     }
 
     async fn read_command(&mut self) -> io::Result<Option<Command>> {
         loop {
             self.line.clear();
-            let bytes_read = self.reader.read_line(&mut self.line).await?;
-            if bytes_read == 0 {
+            let n = self.reader.read_until(b'\n', &mut self.line).await?;
+            if n == 0 {
                 return Ok(None);
             }
 
-            let parts: Vec<&str> = self.line.split_whitespace().collect();
+            if self.line.last() != Some(&b'\n') {
+                return Ok(None);
+            }
+
+            while matches!(self.line.last(), Some(b'\n') | Some(b'\r')) {
+                self.line.pop();
+            }
+
+            let parts: Vec<&[u8]> = self
+                .line
+                .split(|&b| b == b' ')
+                .filter(|s| !s.is_empty())
+                .collect();
+
             match parts.as_slice() {
-                [op @ ("get" | "gets"), keys @ ..] if !keys.is_empty() => {
-                    let with_cas = *op == "gets";
-                    return Ok(Some(Command::Get {
-                        keys: keys.iter().map(|s| s.to_string()).collect(),
-                        with_cas,
-                    }));
+                [op @ (b"get" | b"gets"), keys @ ..] if !keys.is_empty() => {
+                    let with_cas = *op == b"gets";
+
+                    let parsed: Result<Vec<Bytes>, ()> = keys
+                        .iter()
+                        .map(|k| {
+                            validate_key(k)?;
+                            Ok(Bytes::copy_from_slice(k))
+                        })
+                        .collect();
+
+                    match parsed {
+                        Ok(out) => {
+                            return Ok(Some(Command::Get {
+                                keys: out,
+                                with_cas,
+                            }));
+                        }
+                        Err(()) => {
+                            self.write_response(&Response::Error).await?; // borrow of self.line is dead by now
+                            continue;
+                        }
+                    }
                 }
                 [
-                    op @ ("add" | "set" | "replace" | "append" | "prepend" | "cas"),
+                    op @ (b"add" | b"set" | b"replace" | b"append" | b"prepend" | b"cas"),
                     key,
                     flags,
                     exptime,
@@ -56,26 +106,18 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                     rest @ ..,
                 ] => {
                     let store_op = match *op {
-                        "add" => StoreOp::Add,
-                        "replace" => StoreOp::Replace,
-                        "set" => StoreOp::Set,
-                        "append" => StoreOp::Append,
-                        "prepend" => StoreOp::Prepend,
-                        "cas" => StoreOp::Cas,
+                        b"add" => StoreOp::Add,
+                        b"replace" => StoreOp::Replace,
+                        b"set" => StoreOp::Set,
+                        b"append" => StoreOp::Append,
+                        b"prepend" => StoreOp::Prepend,
+                        b"cas" => StoreOp::Cas,
                         _ => unreachable!(),
                     };
-
-                    let Ok(bytes_len) = bytes_len.parse::<usize>() else {
-                        tracing::warn!(line = %self.line.trim_end(), "malformed byte length");
+                    let Ok(bytes_len) = parse_field::<usize>(bytes_len) else {
+                        tracing::warn!(line = %&String::from_utf8_lossy(&self.line), "malformed byte length");
                         self.write_response(&Response::Error).await?;
                         return Ok(None);
-                    };
-
-                    let (Ok(flags), Ok(exptime)) = (flags.parse(), exptime.parse()) else {
-                        tracing::warn!(line = %self.line.trim_end(), "malformed flags/exptime");
-                        self.discard_exact(bytes_len + 2).await?;
-                        self.write_response(&Response::Error).await?;
-                        continue;
                     };
 
                     if bytes_len > MAX_ITEM_SIZE {
@@ -84,6 +126,22 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                         self.write_response(&Response::Error).await?;
                         continue;
                     }
+
+                    if validate_key(key).is_err() {
+                        tracing::warn!(key = %String::from_utf8_lossy(key), "invalid key");
+                        self.discard_exact(bytes_len + 2).await?;
+                        self.write_response(&Response::Error).await?;
+                        continue;
+                    }
+
+                    let (Ok(flags), Ok(exptime)) =
+                        (parse_field::<u32>(flags), parse_field::<i64>(exptime))
+                    else {
+                        tracing::warn!(line = %String::from_utf8_lossy(&self.line), "malformed flags/exptime");
+                        self.discard_exact(bytes_len + 2).await?;
+                        self.write_response(&Response::Error).await?;
+                        continue;
+                    };
 
                     let mut data = BytesMut::zeroed(bytes_len);
                     self.reader.read_exact(&mut data).await?;
@@ -100,7 +158,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                     let (cas, rest) = if store_op == StoreOp::Cas {
                         match rest {
                             [cas_unique, rest @ ..] => {
-                                let Ok(cas_unique) = cas_unique.parse::<u64>() else {
+                                let Ok(cas_unique) = parse_field::<u64>(cas_unique) else {
                                     self.write_response(&Response::Error).await?;
                                     continue;
                                 };
@@ -117,7 +175,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
 
                     let noreply = match rest {
                         [] => false,
-                        ["noreply"] => true,
+                        [b"noreply"] => true,
                         _ => {
                             self.write_response(&Response::Error).await?;
                             continue;
@@ -127,7 +185,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                     return Ok(Some(Command::Store(
                         store_op,
                         StoreArgs {
-                            key: key.to_string(),
+                            key: Bytes::copy_from_slice(key),
                             flags,
                             exptime,
                             data,
@@ -136,10 +194,15 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                         },
                     )));
                 }
-                ["delete", key, rest @ ..] => {
+                [b"delete", key, rest @ ..] => {
+                    if validate_key(key).is_err() {
+                        self.write_response(&Response::Error).await?;
+                        continue;
+                    }
+
                     let noreply = match rest {
                         [] => false,
-                        ["noreply"] => true,
+                        [b"noreply"] => true,
                         _ => {
                             self.write_response(&Response::Error).await?;
                             continue;
@@ -147,12 +210,12 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                     };
 
                     return Ok(Some(Command::Delete {
-                        key: key.to_string(),
+                        key: Bytes::copy_from_slice(key),
                         noreply,
                     }));
                 }
                 _ => {
-                    tracing::warn!(line = %self.line.trim_end(), "unrecognized command");
+                    tracing::warn!(line = %String::from_utf8_lossy(&self.line), "unrecognized command");
                     self.write_response(&Response::Error).await?;
                     continue;
                 }
@@ -170,11 +233,13 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
             Response::Error => self.writer.write_all(b"ERROR\r\n").await?,
             Response::Values(values) => {
                 for (key, flags, data, cas) in values {
-                    let header = match cas {
-                        Some(cas) => format!("VALUE {key} {flags} {} {cas}\r\n", data.len()),
-                        None => format!("VALUE {key} {flags} {}\r\n", data.len()),
+                    self.writer.write_all(b"VALUE ").await?;
+                    self.writer.write_all(key).await?;
+                    let meta = match cas {
+                        Some(cas) => format!(" {flags} {} {cas}\r\n", data.len()),
+                        None => format!(" {flags} {}\r\n", data.len()),
                     };
-                    self.writer.write_all(header.as_bytes()).await?;
+                    self.writer.write_all(meta.as_bytes()).await?;
                     self.writer.write_all(data).await?;
                     self.writer.write_all(b"\r\n").await?;
                 }
@@ -229,7 +294,7 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
             Response::Values(values)
         }
         Command::Store(op, args) => {
-            tracing::debug!(?op, key = %args.key, len = args.data.len(), exptime = args.exptime, "store");
+            tracing::debug!(?op, key = ?args.key, len = args.data.len(), exptime = args.exptime, "store");
 
             let now = SystemTime::now();
             let mut store = store.write().unwrap();
@@ -308,7 +373,7 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
             }
         }
         Command::Delete { key, noreply: _ } => {
-            tracing::debug!(%key, "delete");
+            tracing::debug!(?key, "delete");
 
             let mut store = store.write().unwrap();
             match store.items.remove(&key) {
@@ -350,7 +415,9 @@ mod tests {
     /// Store pre-populated with one item under `key`.
     fn store_with(key: &str, item: Item) -> Store {
         let mut inner = StoreInner::new();
-        inner.items.insert(key.into(), item);
+        inner
+            .items
+            .insert(Bytes::copy_from_slice(key.as_bytes()), item);
         Arc::new(RwLock::new(inner))
     }
 
@@ -419,7 +486,7 @@ mod tests {
         }
 
         let s = store.read().unwrap();
-        assert!(s.items.get("foo").is_none());
+        assert!(s.items.get("foo".as_bytes()).is_none());
     }
 
     #[test]
@@ -461,7 +528,10 @@ mod tests {
         assert!(matches!(resp, Response::NotStored));
 
         let s = store.read().unwrap();
-        let item = s.items.get("foo").expect("key should still be present");
+        let item = s
+            .items
+            .get("foo".as_bytes())
+            .expect("key should still be present");
         assert_eq!(item.data().as_ref(), b"hello");
         assert_eq!(item.flags(), 42);
     }
@@ -509,7 +579,10 @@ mod tests {
         assert!(matches!(resp, Response::Stored));
 
         let s = store.read().unwrap();
-        let item = s.items.get("foo").expect("key should still be present");
+        let item = s
+            .items
+            .get("foo".as_bytes())
+            .expect("key should still be present");
         assert_eq!(item.data().as_ref(), b"jello");
     }
 
@@ -578,7 +651,7 @@ mod tests {
         assert!(matches!(resp, Response::Stored));
 
         let s = store.read().unwrap();
-        let item = s.items.get("foo").unwrap();
+        let item = s.items.get("foo".as_bytes()).unwrap();
         assert_eq!(item.data().as_ref(), b"hello");
         assert_eq!(item.flags(), 42);
     }
@@ -605,7 +678,7 @@ mod tests {
         assert!(matches!(resp, Response::Stored));
 
         let s = store.read().unwrap();
-        let item = s.items.get("foo").unwrap();
+        let item = s.items.get("foo".as_bytes()).unwrap();
         assert_eq!(item.data().as_ref(), b"jello");
         assert_eq!(item.flags(), 21);
     }
@@ -625,7 +698,7 @@ mod tests {
         assert!(matches!(resp, Response::Deleted));
 
         let s = store.read().unwrap();
-        assert!(s.items.get("foo").is_none());
+        assert!(s.items.get("foo".as_bytes()).is_none());
     }
 
     #[test]
@@ -643,6 +716,6 @@ mod tests {
         assert!(matches!(resp, Response::NotFound));
 
         let s = store.read().unwrap();
-        assert!(s.items.get("foo").is_some());
+        assert!(s.items.get("foo".as_bytes()).is_some());
     }
 }

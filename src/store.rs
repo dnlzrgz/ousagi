@@ -72,7 +72,7 @@ impl Item {
 
 #[derive(Default)]
 pub struct StoreInner {
-    pub items: HashMap<String, Item>,
+    pub items: HashMap<Bytes, Item>,
     pub next_cas: u64,
 }
 
