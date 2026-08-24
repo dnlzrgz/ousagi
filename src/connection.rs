@@ -68,7 +68,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                 if n as u64 == MAX_LINE_LEN {
                     tracing::warn!("line exceeds {MAX_LINE_LEN} bytes");
                     self.discard_until_newline().await?;
-                    self.write_response(&Response::Error).await?;
+                    self.write_response(&Response::ClientError("line too long"))
+                        .await?;
                     continue;
                 } else {
                     return Ok(None); // EOF
@@ -105,7 +106,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                             }));
                         }
                         Err(()) => {
-                            self.write_response(&Response::Error).await?; // borrow of self.line is dead by now
+                            self.write_response(&Response::ClientError("bad command line format"))
+                                .await?;
                             continue;
                         }
                     }
@@ -129,21 +131,24 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                     };
                     let Ok(bytes_len) = parse_field::<usize>(bytes_len) else {
                         tracing::warn!(line = %&String::from_utf8_lossy(&self.line), "malformed byte length");
-                        self.write_response(&Response::Error).await?;
+                        self.write_response(&Response::ClientError("bad command line format"))
+                            .await?;
                         return Ok(None);
                     };
 
                     if bytes_len > MAX_ITEM_SIZE {
                         tracing::warn!(bytes_len, max = MAX_ITEM_SIZE, "item exceeds max size");
                         self.discard_exact(bytes_len + 2).await?;
-                        self.write_response(&Response::Error).await?;
+                        self.write_response(&Response::ServerError("object too large for cache"))
+                            .await?;
                         continue;
                     }
 
                     if validate_key(key).is_err() {
                         tracing::warn!(key = %String::from_utf8_lossy(key), "invalid key");
                         self.discard_exact(bytes_len + 2).await?;
-                        self.write_response(&Response::Error).await?;
+                        self.write_response(&Response::ClientError("bad command line format"))
+                            .await?;
                         continue;
                     }
 
@@ -152,7 +157,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                     else {
                         tracing::warn!(line = %String::from_utf8_lossy(&self.line), "malformed flags/exptime");
                         self.discard_exact(bytes_len + 2).await?;
-                        self.write_response(&Response::Error).await?;
+                        self.write_response(&Response::ClientError("bad command line format"))
+                            .await?;
                         continue;
                     };
 
@@ -164,7 +170,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                     self.reader.read_exact(&mut crlf).await?;
                     if crlf != *b"\r\n" {
                         tracing::warn!("missing trailing CRLF after data block");
-                        self.write_response(&Response::Error).await?;
+                        self.write_response(&Response::ClientError("bad data chunk"))
+                            .await?;
                         continue;
                     }
 
@@ -172,13 +179,19 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                         match rest {
                             [cas_unique, rest @ ..] => {
                                 let Ok(cas_unique) = parse_field::<u64>(cas_unique) else {
-                                    self.write_response(&Response::Error).await?;
+                                    self.write_response(&Response::ClientError(
+                                        "bad command line format",
+                                    ))
+                                    .await?;
                                     continue;
                                 };
                                 (Some(cas_unique), rest)
                             }
                             [] => {
-                                self.write_response(&Response::Error).await?;
+                                self.write_response(&Response::ClientError(
+                                    "bad command line format",
+                                ))
+                                .await?;
                                 continue;
                             }
                         }
@@ -190,7 +203,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                         [] => false,
                         [b"noreply"] => true,
                         _ => {
-                            self.write_response(&Response::Error).await?;
+                            self.write_response(&Response::ClientError("bad command line format"))
+                                .await?;
                             continue;
                         }
                     };
@@ -209,7 +223,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                 }
                 [b"delete", key, rest @ ..] => {
                     if validate_key(key).is_err() {
-                        self.write_response(&Response::Error).await?;
+                        self.write_response(&Response::ClientError("bad command line format"))
+                            .await?;
                         continue;
                     }
 
@@ -217,7 +232,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                         [] => false,
                         [b"noreply"] => true,
                         _ => {
-                            self.write_response(&Response::Error).await?;
+                            self.write_response(&Response::ClientError("bad command line format"))
+                                .await?;
                             continue;
                         }
                     };
@@ -244,6 +260,16 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
             Response::NotFound => self.writer.write_all(b"NOT_FOUND\r\n").await?,
             Response::Exists => self.writer.write_all(b"EXISTS\r\n").await?,
             Response::Error => self.writer.write_all(b"ERROR\r\n").await?,
+            Response::ClientError(msg) => {
+                self.writer.write_all(b"CLIENT_ERROR ").await?;
+                self.writer.write_all(msg.as_bytes()).await?;
+                self.writer.write_all(b"\r\n").await?;
+            }
+            Response::ServerError(msg) => {
+                self.writer.write_all(b"SERVER_ERROR ").await?;
+                self.writer.write_all(msg.as_bytes()).await?;
+                self.writer.write_all(b"\r\n").await?;
+            }
             Response::Values(values) => {
                 for (key, flags, data, cas) in values {
                     self.writer.write_all(b"VALUE ").await?;
@@ -474,7 +500,7 @@ mod tests {
 
         let mut buf = [0; 128];
         let n = client.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"EROR\r\n");
+        assert_eq!(&buf[..n], b"CLIENT_ERROR bad command line format\r\n");
     }
 
     #[tokio::test]
@@ -491,7 +517,7 @@ mod tests {
 
         let mut buf = [0; 128];
         let n = client.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"ERROR\r\n");
+        assert_eq!(&buf[..n], b"CLIENT_ERROR line too long\r\n");
     }
 
     #[test]

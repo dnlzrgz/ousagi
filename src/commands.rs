@@ -48,4 +48,6 @@ pub enum Response {
     Exists,
     Values(Vec<(Bytes, u32, Bytes, Option<u64>)>),
     Error,
+    ClientError(&'static str),
+    ServerError(&'static str),
 }
