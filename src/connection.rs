@@ -9,7 +9,7 @@ use tokio::{
 };
 
 use crate::{
-    commands::{Command, Response, StoreArgs, StoreOp},
+    commands::{ArithmeticOp, Command, Response, StoreArgs, StoreOp},
     store::{Item, Store},
 };
 
@@ -243,6 +243,42 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                         noreply,
                     }));
                 }
+                [arithmetic_op @ (b"incr" | b"decr"), key, delta, rest @ ..] => {
+                    let arithmetic_op = match *arithmetic_op {
+                        b"incr" => ArithmeticOp::Incr,
+                        b"decr" => ArithmeticOp::Decr,
+                        _ => unreachable!(),
+                    };
+
+                    if validate_key(key).is_err() {
+                        self.write_response(&Response::ClientError("bad command line format"))
+                            .await?;
+                        continue;
+                    }
+
+                    let Ok(delta) = parse_field::<u64>(delta) else {
+                        self.write_response(&Response::ClientError("invalid numeric delta"))
+                            .await?;
+                        continue;
+                    };
+
+                    let noreply = match rest {
+                        [] => false,
+                        [b"noreply"] => true,
+                        _ => {
+                            self.write_response(&Response::ClientError("bad command line format"))
+                                .await?;
+                            continue;
+                        }
+                    };
+
+                    return Ok(Some(Command::Arithmetic {
+                        op: arithmetic_op,
+                        key: Bytes::copy_from_slice(key),
+                        delta,
+                        noreply,
+                    }));
+                }
                 _ => {
                     tracing::warn!(line = %String::from_utf8_lossy(&self.line), "unrecognized command");
                     self.write_response(&Response::Error).await?;
@@ -259,6 +295,10 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
             Response::Deleted => self.writer.write_all(b"DELETED\r\n").await?,
             Response::NotFound => self.writer.write_all(b"NOT_FOUND\r\n").await?,
             Response::Exists => self.writer.write_all(b"EXISTS\r\n").await?,
+            Response::Number(val) => {
+                self.writer.write_all(val.to_string().as_bytes()).await?;
+                self.writer.write_all(b"\r\n").await?;
+            }
             Response::Error => self.writer.write_all(b"ERROR\r\n").await?,
             Response::ClientError(msg) => {
                 self.writer.write_all(b"CLIENT_ERROR ").await?;
@@ -433,6 +473,52 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
                 None => Response::NotFound,
             }
         }
+        Command::Arithmetic {
+            op,
+            key,
+            delta,
+            noreply: _,
+        } => {
+            tracing::debug!(?op, ?key, delta, "incr/decr");
+
+            let now = SystemTime::now();
+            let mut store = store.write().unwrap();
+
+            let cas = store.next_cas;
+            store.next_cas += 1;
+
+            let error = match op {
+                ArithmeticOp::Incr => "cannot increment non-numeric value",
+                ArithmeticOp::Decr => "cannot decrement non-numeric value",
+            };
+
+            match store.items.entry(key) {
+                Entry::Occupied(mut entry) if !entry.get().is_expired(now) => {
+                    let old_item = entry.get();
+
+                    let Ok(s) = std::str::from_utf8(old_item.data()) else {
+                        return Response::ClientError(error);
+                    };
+
+                    let Ok(val) = s.trim().parse::<u64>() else {
+                        return Response::ClientError(error);
+                    };
+
+                    let new_val = match op {
+                        ArithmeticOp::Incr => val.wrapping_add(delta),
+                        ArithmeticOp::Decr => val.saturating_sub(delta),
+                    };
+                    let new_data = Bytes::from(new_val.to_string());
+
+                    let new_item =
+                        Item::with_parts(new_data, old_item.flags(), old_item.expires_at(), cas);
+
+                    entry.insert(new_item);
+                    Response::Number(new_val)
+                }
+                _ => Response::NotFound,
+            }
+        }
     }
 }
 
@@ -536,10 +622,7 @@ mod tests {
 
     #[test]
     fn get_multiple_keys_skips_missing_one() {
-        let store = store_with(
-            &"foo".to_string(),
-            Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1),
-        );
+        let store = store_with("foo", Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1));
         let cmd = Command::Get {
             keys: vec!["foo".into(), "bar".into()],
             with_cas: false,
@@ -644,10 +727,7 @@ mod tests {
 
     #[test]
     fn replace_existing_key_stores_new_value() {
-        let store = store_with(
-            "foo".into(),
-            Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1),
-        );
+        let store = store_with("foo", Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1));
 
         let cmd = Command::Store(
             StoreOp::Replace,
@@ -674,10 +754,7 @@ mod tests {
 
     #[test]
     fn replace_missing_key_returns_not_stored() {
-        let store = store_with(
-            "foo".into(),
-            Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1),
-        );
+        let store = store_with("foo", Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1));
 
         let cmd = Command::Store(
             StoreOp::Replace,
@@ -698,7 +775,7 @@ mod tests {
     #[test]
     fn replace_expired_key_returns_not_stored() {
         let store = store_with(
-            "foo".into(),
+            "foo",
             Item::new(Bytes::copy_from_slice(b"hello"), 42, -1, 1),
         );
 
@@ -744,10 +821,7 @@ mod tests {
 
     #[test]
     fn set_overwrites_existing_key() {
-        let store = store_with(
-            "foo".into(),
-            Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1),
-        );
+        let store = store_with("foo", Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1));
         let cmd = Command::Store(
             StoreOp::Set,
             StoreArgs {
@@ -771,10 +845,7 @@ mod tests {
 
     #[test]
     fn delete_existing_key_returns_deleted_and_removes_it() {
-        let store = store_with(
-            "foo".into(),
-            Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1),
-        );
+        let store = store_with("foo", Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1));
         let cmd = Command::Delete {
             key: "foo".into(),
             noreply: true,
@@ -789,10 +860,7 @@ mod tests {
 
     #[test]
     fn delete_missing_key_returns_not_found() {
-        let store = store_with(
-            "foo".into(),
-            Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1),
-        );
+        let store = store_with("foo", Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1));
         let cmd = Command::Delete {
             key: "bar".into(),
             noreply: true,
@@ -803,5 +871,120 @@ mod tests {
 
         let s = store.read().unwrap();
         assert!(s.items.get("foo".as_bytes()).is_some());
+    }
+
+    #[test]
+    fn incr_existing_key_increments_value_and_returns_it() {
+        let store = store_with("foo", Item::new(Bytes::from_static(b"10"), 42, 0, 1));
+        let cmd = Command::Arithmetic {
+            op: ArithmeticOp::Incr,
+            key: "foo".into(),
+            delta: 5,
+            noreply: false,
+        };
+
+        let resp = execute(cmd, &store);
+        assert!(matches!(resp, Response::Number(15)));
+
+        let s = store.read().unwrap();
+        let item = s
+            .items
+            .get("foo".as_bytes())
+            .expect("key should still be present");
+        assert_eq!(item.data().as_ref(), b"15");
+    }
+
+    #[test]
+    fn incr_missing_key_returns_not_found() {
+        let store = store_with("foo", Item::new(Bytes::from_static(b"10"), 42, 0, 1));
+        let cmd = Command::Arithmetic {
+            op: ArithmeticOp::Incr,
+            key: "bar".into(),
+            delta: 5,
+            noreply: false,
+        };
+
+        let resp = execute(cmd, &store);
+        assert!(matches!(resp, Response::NotFound));
+    }
+
+    #[test]
+    fn incr_overflow_wraps_around() {
+        let store = store_with(
+            "foo",
+            Item::new(Bytes::from(u64::MAX.to_string()), 42, 0, 1),
+        );
+        let cmd = Command::Arithmetic {
+            op: ArithmeticOp::Incr,
+            key: "foo".into(),
+            delta: 1,
+            noreply: false,
+        };
+
+        let resp = execute(cmd, &store);
+        assert!(matches!(resp, Response::Number(0)));
+
+        let s = store.read().unwrap();
+        let item = s
+            .items
+            .get("foo".as_bytes())
+            .expect("key should still be present");
+        assert_eq!(item.data().as_ref(), b"0");
+    }
+
+    #[test]
+    fn decr_existing_key_decrements_value_and_returns_it() {
+        let store = store_with("foo", Item::new(Bytes::from_static(b"10"), 42, 0, 1));
+        let cmd = Command::Arithmetic {
+            op: ArithmeticOp::Decr,
+            key: "foo".into(),
+            delta: 5,
+            noreply: false,
+        };
+
+        let resp = execute(cmd, &store);
+        assert!(matches!(resp, Response::Number(5)));
+
+        let s = store.read().unwrap();
+        let item = s
+            .items
+            .get("foo".as_bytes())
+            .expect("key should still be present");
+        assert_eq!(item.data().as_ref(), b"5");
+    }
+
+    #[test]
+    fn decr_missing_key_returns_not_found() {
+        let store = store_with("foo", Item::new(Bytes::from_static(b"10"), 42, 0, 1));
+        let cmd = Command::Arithmetic {
+            op: ArithmeticOp::Decr,
+            key: "bar".into(),
+            delta: 5,
+            noreply: false,
+        };
+
+        let resp = execute(cmd, &store);
+        assert!(matches!(resp, Response::NotFound));
+    }
+
+    #[test]
+    fn decr_underflow_saturates_at_zero() {
+        let store = store_with("foo", Item::new(Bytes::from_static(b"0"), 42, 0, 1));
+        let cmd = Command::Arithmetic {
+            op: ArithmeticOp::Decr,
+            key: "foo".into(),
+            delta: 1,
+            noreply: false,
+        };
+
+        let resp = execute(cmd, &store);
+        assert!(matches!(resp, Response::Number(0)));
+
+        let s = store.read().unwrap();
+        let item = s
+            .items
+            .get("foo".as_bytes())
+            .expect("key should still be present");
+        assert_eq!(item.data().as_ref(), b"0");
     }
 }

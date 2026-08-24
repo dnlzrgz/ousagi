@@ -19,10 +19,28 @@ pub struct StoreArgs {
     pub cas: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithmeticOp {
+    Incr,
+    Decr,
+}
+
 pub enum Command {
-    Get { keys: Vec<Bytes>, with_cas: bool },
+    Get {
+        keys: Vec<Bytes>,
+        with_cas: bool,
+    },
     Store(StoreOp, StoreArgs),
-    Delete { key: Bytes, noreply: bool },
+    Delete {
+        key: Bytes,
+        noreply: bool,
+    },
+    Arithmetic {
+        op: ArithmeticOp,
+        key: Bytes,
+        delta: u64,
+        noreply: bool,
+    },
 }
 
 impl Command {
@@ -31,9 +49,9 @@ impl Command {
     /// match on `Command` again just to find the flag.
     pub(crate) fn noreply(&self) -> bool {
         match self {
-            Command::Store(_, args) => args.noreply,
-            Command::Delete { noreply, .. } => *noreply,
             Command::Get { .. } => false,
+            Command::Store(_, args) => args.noreply,
+            Command::Delete { noreply, .. } | Command::Arithmetic { noreply, .. } => *noreply,
         }
     }
 }
@@ -47,6 +65,7 @@ pub enum Response {
     NotFound,
     Exists,
     Values(Vec<(Bytes, u32, Bytes, Option<u64>)>),
+    Number(u64),
     Error,
     ClientError(&'static str),
     ServerError(&'static str),
