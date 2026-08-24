@@ -20,7 +20,8 @@ pub(crate) struct Connection<R, W> {
 }
 
 const MAX_ITEM_SIZE: usize = 1024 * 1024; // 1 MiB
-const MAX_KEY_LEN: usize = 250;
+const MAX_KEY_LEN: usize = 250; // bytes
+const MAX_LINE_LEN: u64 = 8 * 1024; // bytes
 
 fn validate_key(key: &[u8]) -> Result<(), ()> {
     if key.is_empty() || key.len() > MAX_KEY_LEN {
@@ -53,13 +54,25 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
     async fn read_command(&mut self) -> io::Result<Option<Command>> {
         loop {
             self.line.clear();
-            let n = self.reader.read_until(b'\n', &mut self.line).await?;
+
+            let n = {
+                let mut limited = (&mut self.reader).take(MAX_LINE_LEN);
+                limited.read_until(b'\n', &mut self.line).await?
+            };
+
             if n == 0 {
-                return Ok(None);
+                return Ok(None); // EOF
             }
 
             if self.line.last() != Some(&b'\n') {
-                return Ok(None);
+                if n as u64 == MAX_LINE_LEN {
+                    tracing::warn!("line exceeds {MAX_LINE_LEN} bytes");
+                    self.discard_until_newline().await?;
+                    self.write_response(&Response::Error).await?;
+                    continue;
+                } else {
+                    return Ok(None); // EOF
+                }
             }
 
             while matches!(self.line.last(), Some(b'\n') | Some(b'\r')) {
@@ -255,6 +268,19 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
         tokio::io::copy(&mut limited, &mut tokio::io::sink()).await?;
         Ok(())
     }
+
+    async fn discard_until_newline(&mut self) -> io::Result<()> {
+        let mut junk = Vec::new();
+        loop {
+            junk.clear();
+
+            let mut limited = (&mut self.reader).take(MAX_LINE_LEN);
+            let n = limited.read_until(b'\n', &mut junk).await?;
+            if n == 0 || junk.last() == Some(&b'\n') {
+                return Ok(());
+            }
+        }
+    }
 }
 
 pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
@@ -432,6 +458,40 @@ mod tests {
         let (server_end, client_end) = duplex(cap);
         let (server_r, server_w) = split(server_end);
         (Connection::new(server_r, server_w), client_end)
+    }
+
+    #[tokio::test]
+    async fn key_exceeding_max_len_returns_error() {
+        let (mut conn, mut client) = mock_connection(1024);
+        let long_key = "k".repeat(251);
+        let request = format!("get {}\r\n", long_key);
+
+        tokio::spawn(async move {
+            let _ = conn.read_command().await;
+        });
+
+        client.write_all(request.as_bytes()).await.unwrap();
+
+        let mut buf = [0; 128];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"EROR\r\n");
+    }
+
+    #[tokio::test]
+    async fn line_exceeding_max_len_returns_error() {
+        let (mut conn, mut client) = mock_connection(16384);
+        let mut request = vec![b'a'; 8192];
+        request.extend_from_slice(b"\n");
+
+        tokio::spawn(async move {
+            let _ = conn.read_command().await;
+        });
+
+        client.write_all(&request).await.unwrap();
+
+        let mut buf = [0; 128];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ERROR\r\n");
     }
 
     #[test]
