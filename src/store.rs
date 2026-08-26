@@ -14,6 +14,7 @@ pub struct Item {
     flags: u32,
     expires_at: Option<SystemTime>,
     cas: u64,
+    stored_at: SystemTime,
 }
 
 impl Item {
@@ -32,6 +33,7 @@ impl Item {
             flags,
             expires_at,
             cas,
+            stored_at: SystemTime::now(),
         }
     }
 
@@ -40,12 +42,14 @@ impl Item {
         flags: u32,
         expires_at: Option<SystemTime>,
         cas: u64,
+        stored_at: SystemTime,
     ) -> Self {
         Self {
             data,
             flags,
             expires_at,
             cas,
+            stored_at,
         }
     }
 
@@ -65,8 +69,22 @@ impl Item {
         self.expires_at
     }
 
-    pub(crate) fn is_expired(&self, now: SystemTime) -> bool {
-        self.expires_at.is_some_and(|t| now >= t)
+    pub(crate) fn stored_at(&self) -> SystemTime {
+        self.stored_at
+    }
+
+    pub(crate) fn is_expired(&self, now: SystemTime, oldest_live: Option<SystemTime>) -> bool {
+        if self.expires_at.is_some_and(|t| now >= t) {
+            return true;
+        }
+
+        if let Some(cutoff) = oldest_live {
+            if self.stored_at() < cutoff {
+                return true;
+            }
+        }
+
+        false
     }
 }
 
@@ -74,6 +92,7 @@ impl Item {
 pub struct StoreInner {
     pub items: HashMap<Bytes, Item>,
     pub next_cas: u64,
+    pub oldest_live: Option<SystemTime>,
 }
 
 impl StoreInner {
@@ -81,6 +100,15 @@ impl StoreInner {
         Self {
             next_cas: 1,
             ..Default::default()
+        }
+    }
+
+    pub fn flush_all(&mut self, delay_secs: u32) {
+        let now = SystemTime::now();
+        self.oldest_live = if delay_secs == 0 {
+            Some(now)
+        } else {
+            now.checked_add(Duration::from_secs(delay_secs as u64))
         }
     }
 }

@@ -41,6 +41,10 @@ pub enum Command {
         delta: u64,
         noreply: bool,
     },
+    FlushAll {
+        delay: Option<u32>,
+        noreply: bool,
+    },
 }
 
 impl Command {
@@ -51,7 +55,9 @@ impl Command {
         match self {
             Command::Get { .. } => false,
             Command::Store(_, args) => args.noreply,
-            Command::Delete { noreply, .. } | Command::Arithmetic { noreply, .. } => *noreply,
+            Command::Delete { noreply, .. }
+            | Command::Arithmetic { noreply, .. }
+            | Command::FlushAll { noreply, .. } => *noreply,
         }
     }
 }
@@ -66,6 +72,7 @@ pub enum Response {
     Exists,
     Values(Vec<(Bytes, u32, Bytes, Option<u64>)>),
     Number(u64),
+    Ok,
     Error,
     ClientError(&'static str),
     ServerError(&'static str),

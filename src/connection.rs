@@ -1,4 +1,8 @@
-use std::{collections::hash_map::Entry, io, time::SystemTime};
+use std::{
+    collections::hash_map::Entry,
+    io,
+    time::{Duration, SystemTime},
+};
 
 use bytes::{Bytes, BytesMut};
 use tokio::{
@@ -279,6 +283,44 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                         noreply,
                     }));
                 }
+                [b"flush_all", rest @ ..] => {
+                    let mut delay: Option<u32> = None;
+                    let mut noreply = false;
+                    match rest {
+                        [] => {}
+                        [b"noreply"] => noreply = true,
+                        [delay_token] => match parse_field::<u32>(delay_token) {
+                            Ok(d) => delay = Some(d),
+                            Err(_) => {
+                                self.write_response(&Response::ClientError(
+                                    "invalid numeric delay",
+                                ))
+                                .await?;
+                                continue;
+                            }
+                        },
+                        [delay_token, b"noreply"] => {
+                            match parse_field::<u32>(delay_token) {
+                                Ok(d) => delay = Some(d),
+                                Err(_) => {
+                                    self.write_response(&Response::ClientError(
+                                        "invalid numeric delay",
+                                    ))
+                                    .await?;
+                                    continue;
+                                }
+                            }
+                            noreply = true;
+                        }
+                        _ => {
+                            self.write_response(&Response::ClientError("bad command line format"))
+                                .await?;
+                            continue;
+                        }
+                    };
+
+                    return Ok(Some(Command::FlushAll { delay, noreply }));
+                }
                 _ => {
                     tracing::warn!(line = %String::from_utf8_lossy(&self.line), "unrecognized command");
                     self.write_response(&Response::Error).await?;
@@ -300,6 +342,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                 self.writer.write_all(b"\r\n").await?;
             }
             Response::Error => self.writer.write_all(b"ERROR\r\n").await?,
+            Response::Ok => self.writer.write_all(b"OK\r\n").await?,
             Response::ClientError(msg) => {
                 self.writer.write_all(b"CLIENT_ERROR ").await?;
                 self.writer.write_all(msg.as_bytes()).await?;
@@ -360,9 +403,10 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
 
             {
                 let store = store.read().unwrap();
+                let oldest_live = store.oldest_live;
                 for key in keys {
                     match store.items.get(&key) {
-                        Some(item) if item.is_expired(now) => expired_keys.push(key),
+                        Some(item) if item.is_expired(now, oldest_live) => expired_keys.push(key),
                         Some(item) => {
                             let cas = if with_cas { Some(item.cas()) } else { None };
                             values.push((key, item.flags(), item.data().clone(), cas));
@@ -374,9 +418,10 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
 
             if !expired_keys.is_empty() {
                 let mut store = store.write().unwrap();
+                let oldest_live = store.oldest_live;
                 for key in expired_keys {
                     if let Entry::Occupied(entry) = store.items.entry(key)
-                        && entry.get().is_expired(now)
+                        && entry.get().is_expired(now, oldest_live)
                     {
                         entry.remove();
                     }
@@ -390,13 +435,16 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
 
             let now = SystemTime::now();
             let mut store = store.write().unwrap();
+            let oldest_live = store.oldest_live;
 
             let cas = store.next_cas;
             store.next_cas += 1;
 
             match op {
                 StoreOp::Add => match store.items.entry(args.key) {
-                    Entry::Occupied(entry) if !entry.get().is_expired(now) => Response::NotStored,
+                    Entry::Occupied(entry) if !entry.get().is_expired(now, oldest_live) => {
+                        Response::NotStored
+                    }
                     Entry::Occupied(mut entry) => {
                         entry.insert(Item::new(args.data, args.flags, args.exptime, cas));
                         Response::Stored
@@ -412,14 +460,14 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
                     Response::Stored
                 }
                 StoreOp::Replace => match store.items.entry(args.key) {
-                    Entry::Occupied(mut entry) if !entry.get().is_expired(now) => {
+                    Entry::Occupied(mut entry) if !entry.get().is_expired(now, oldest_live) => {
                         entry.insert(Item::new(args.data, args.flags, args.exptime, cas));
                         Response::Stored
                     }
                     _ => Response::NotStored,
                 },
                 StoreOp::Append | StoreOp::Prepend => match store.items.entry(args.key) {
-                    Entry::Occupied(mut entry) if !entry.get().is_expired(now) => {
+                    Entry::Occupied(mut entry) if !entry.get().is_expired(now, oldest_live) => {
                         let old_item = entry.get();
 
                         let mut new_data =
@@ -439,6 +487,7 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
                             old_item.flags(),
                             old_item.expires_at(),
                             cas,
+                            old_item.stored_at(),
                         );
                         entry.insert(item);
                         Response::Stored
@@ -446,7 +495,7 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
                     _ => Response::NotStored,
                 },
                 StoreOp::Cas => match store.items.entry(args.key) {
-                    Entry::Occupied(mut entry) if !entry.get().is_expired(now) => {
+                    Entry::Occupied(mut entry) if !entry.get().is_expired(now, oldest_live) => {
                         if entry.get().cas() != args.cas.unwrap() {
                             tracing::debug!(
                                 expected = args.cas.unwrap(),
@@ -483,6 +532,7 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
 
             let now = SystemTime::now();
             let mut store = store.write().unwrap();
+            let oldest_live = store.oldest_live;
 
             let cas = store.next_cas;
             store.next_cas += 1;
@@ -493,7 +543,7 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
             };
 
             match store.items.entry(key) {
-                Entry::Occupied(mut entry) if !entry.get().is_expired(now) => {
+                Entry::Occupied(mut entry) if !entry.get().is_expired(now, oldest_live) => {
                     let old_item = entry.get();
 
                     let Ok(s) = std::str::from_utf8(old_item.data()) else {
@@ -510,14 +560,39 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
                     };
                     let new_data = Bytes::from(new_val.to_string());
 
-                    let new_item =
-                        Item::with_parts(new_data, old_item.flags(), old_item.expires_at(), cas);
+                    let new_item = Item::with_parts(
+                        new_data,
+                        old_item.flags(),
+                        old_item.expires_at(),
+                        cas,
+                        old_item.stored_at(),
+                    );
 
                     entry.insert(new_item);
                     Response::Number(new_val)
                 }
                 _ => Response::NotFound,
             }
+        }
+        Command::FlushAll { delay, noreply: _ } => {
+            tracing::debug!(?delay, "flush_all");
+
+            let mut store = store.write().unwrap();
+            match delay {
+                Some(0) => {
+                    store.items.clear();
+                }
+                Some(n) => {
+                    let now = SystemTime::now();
+                    store.oldest_live = now.checked_add(Duration::from_secs(n as u64));
+                }
+                None => {
+                    store.items.clear();
+                    return Response::Ok;
+                }
+            }
+
+            Response::Ok
         }
     }
 }
@@ -979,6 +1054,41 @@ mod tests {
 
         let resp = execute(cmd, &store);
         assert!(matches!(resp, Response::Number(0)));
+
+        let s = store.read().unwrap();
+        let item = s
+            .items
+            .get("foo".as_bytes())
+            .expect("key should still be present");
+        assert_eq!(item.data().as_ref(), b"0");
+    }
+
+    #[test]
+    fn flush_all_immediate_clears_all_items_and_returns_ok() {
+        let store = store_with("foo", Item::new(Bytes::from_static(b"0"), 42, 0, 1));
+        let cmd = Command::FlushAll {
+            delay: None,
+            noreply: false,
+        };
+
+        let resp = execute(cmd, &store);
+        assert!(matches!(resp, Response::Ok));
+
+        let s = store.read().unwrap();
+        assert!(s.items.get("foo".as_bytes()).is_none());
+        assert!(s.items.is_empty());
+    }
+
+    #[test]
+    fn flush_all_with_delay_does_not_immediately_remove_items() {
+        let store = store_with("foo", Item::new(Bytes::from_static(b"0"), 42, 0, 1));
+        let cmd = Command::FlushAll {
+            delay: Some(3600),
+            noreply: false,
+        };
+
+        let resp = execute(cmd, &store);
+        assert!(matches!(resp, Response::Ok));
 
         let s = store.read().unwrap();
         let item = s
