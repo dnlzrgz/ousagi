@@ -9,9 +9,14 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tokio = { version = "1.53.1", features = ["full"] }
 bytes = "1.12.1"
-criterion = { version = "0.8.2", features = ["async_tokio", "html_reports"] }
-rand = { version = "0.8.7", features = ["small_rng"] }
 
-[[bench]]
-name = "throughput"
-harness = false
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# panic = "abort"
+strip = true
+
+[profile.bench]
+inherits = "release"
+debug = true
