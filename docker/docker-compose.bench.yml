@@ -1,0 +1,40 @@
+services:
+  ousagi:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: ousagi-bench
+    command: ["/bin/server", "-p", "11211", "-t", "${OUSAGI_THREADS:-4}"]
+    ports:
+      - "11211:11211"
+    environment:
+      - RUST_LOG=info
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    networks:
+      - bench
+
+  memtier:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.memtier
+    container_name: ousagi-memtier
+    networks:
+      - bench
+    command: >
+      --server=ousagi --port=11211
+      --protocol=memcache_text
+      --clients=50 --threads=4
+      --data-size=128 --ratio=1:10
+      --key-pattern=R:R
+      --test-time=30
+      --print-percentiles=50,90,99,99.9
+
+networks:
+  bench:
+    driver: bridge

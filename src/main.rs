@@ -77,7 +77,6 @@ async fn run(args: Args) {
     tracing::info!(addr = %addr, threads = args.threads, "listening");
 
     let store: Store = Arc::new(RwLock::new(StoreInner::new()));
-
     loop {
         let (socket, addr) = listener.accept().await.unwrap();
         tracing::info!(%addr, "accepted connection");
