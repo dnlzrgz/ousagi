@@ -1,7 +1,4 @@
-use std::{
-    net::SocketAddr,
-    sync::{Arc, RwLock},
-};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use clap::{ArgAction, Parser};
 use ousagi::{
@@ -51,7 +48,7 @@ fn parse_threads(s: &str) -> Result<usize, String> {
 
 fn verbosity_level(v: u8) -> &'static str {
     match v {
-        0 => "warm",
+        0 => "warn",
         1 => "info",
         _ => "debug",
     }
@@ -76,10 +73,17 @@ async fn run(args: Args) {
     let listener = TcpListener::bind(addr).await.unwrap();
     tracing::info!(addr = %addr, threads = args.threads, "listening");
 
-    let store: Store = Arc::new(RwLock::new(StoreInner::new()));
+    let store: Store = Arc::new(StoreInner::new());
     loop {
-        let (socket, addr) = listener.accept().await.unwrap();
-        tracing::info!(%addr, "accepted connection");
+        let (socket, addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(error = %e, "accept failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        tracing::info!(%addr, "connection accepted");
 
         let store = store.clone();
         tokio::spawn(async move {

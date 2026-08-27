@@ -223,10 +223,11 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "ousagi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "clap",
+ "parking_lot",
  "tokio",
  "tracing",
  "tracing-subscriber",

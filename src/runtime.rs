@@ -1,7 +1,7 @@
 use tokio::runtime::{Builder, Runtime};
 
 pub fn build(threads: usize) -> Runtime {
-    if threads >= 1 {
+    if threads > 1 {
         Builder::new_multi_thread()
             .worker_threads(threads)
             .enable_all()

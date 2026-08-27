@@ -1,10 +1,14 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
 use bytes::Bytes;
+use parking_lot::RwLock;
 
 const THIRTY_DAYS_SECS: i64 = 60 * 60 * 24 * 30;
 
@@ -88,30 +92,44 @@ impl Item {
     }
 }
 
-#[derive(Default)]
 pub struct StoreInner {
-    pub items: HashMap<Bytes, Item>,
-    pub next_cas: u64,
-    pub oldest_live: Option<SystemTime>,
+    pub items: RwLock<HashMap<Bytes, Item>>,
+    next_cas: AtomicU64,
+    oldest_live: AtomicU64,
 }
 
 impl StoreInner {
     pub fn new() -> Self {
         Self {
-            next_cas: 1,
-            ..Default::default()
+            items: RwLock::new(HashMap::new()),
+            next_cas: AtomicU64::new(1),
+            oldest_live: AtomicU64::new(0),
         }
     }
 
-    pub fn flush_all(&mut self, delay_secs: u32) {
-        let now = SystemTime::now();
-        self.oldest_live = if delay_secs == 0 {
-            Some(now)
+    pub fn next_cas(&self) -> u64 {
+        self.next_cas.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn oldest_live(&self) -> Option<SystemTime> {
+        let secs = self.oldest_live.load(Ordering::Relaxed);
+        if secs == 0 {
+            None
         } else {
-            now.checked_add(Duration::from_secs(delay_secs as u64))
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
         }
+    }
+
+    pub fn flush_all(&self, delay_secs: u32) {
+        let now_secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let new_oldest = now_secs + delay_secs as u64;
+        self.oldest_live.store(new_oldest, Ordering::Relaxed);
     }
 }
 
 /// Shared handle to the whole cache.
-pub type Store = Arc<RwLock<StoreInner>>;
+pub type Store = Arc<StoreInner>;

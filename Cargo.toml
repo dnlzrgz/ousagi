@@ -1,6 +1,6 @@
 [package]
 name = "ousagi"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
@@ -9,6 +9,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tokio = { version = "1.53.1", features = ["full"] }
 bytes = "1.12.1"
+parking_lot = "0.12.5"
 
 [profile.release]
 opt-level = 3
