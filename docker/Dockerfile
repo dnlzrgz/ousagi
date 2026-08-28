@@ -1,10 +1,7 @@
 ARG RUST_VERSION=1.98
 ARG APP_NAME=ousagi
 
-################################################################################
-# Build stage
-################################################################################
-FROM docker.io/library/rust:${RUST_VERSION}-alpine AS build
+FROM rust:${RUST_VERSION}-alpine AS build
 ARG APP_NAME
 WORKDIR /app
 
@@ -18,10 +15,7 @@ RUN --mount=type=bind,source=src,target=src \
     CARGO_HOME=/var/cache/cargo cargo build --locked --release && \
     cp ./target/release/$APP_NAME /bin/server
 
-################################################################################
-# Runtime stage
-################################################################################
-FROM docker.io/library/alpine:3.24.1 AS final
+FROM alpine:3.24.1
 
 ARG UID=10001
 RUN adduser \

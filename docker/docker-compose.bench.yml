@@ -20,9 +20,7 @@ services:
       - bench
 
   memtier:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.memtier
+    image: redislabs/memtier_benchmark:2.5.1
     container_name: ousagi-memtier
     networks:
       - bench
