@@ -10,6 +10,7 @@ use tokio::{
 
 use crate::{
     commands::{ArithmeticOp, Command, Response, StoreArgs, StoreOp},
+    parser::{parse_field, validate_key},
     store::{Item, Store},
 };
 
@@ -20,27 +21,7 @@ pub(crate) struct Connection<R, W> {
 }
 
 const MAX_ITEM_SIZE: usize = 1024 * 1024; // 1 MiB
-const MAX_KEY_LEN: usize = 250; // bytes
 const MAX_LINE_LEN: u64 = 8 * 1024; // bytes
-
-fn validate_key(key: &[u8]) -> Result<(), ()> {
-    if key.is_empty() || key.len() > MAX_KEY_LEN {
-        return Err(());
-    }
-
-    if key.iter().any(|&b| b <= 0x20 || b == 0x7F) {
-        return Err(());
-    }
-
-    Ok(())
-}
-
-fn parse_field<T: std::str::FromStr>(tok: &[u8]) -> Result<T, ()> {
-    std::str::from_utf8(tok)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or(())
-}
 
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
     fn new(reader: R, writer: W) -> Self {
