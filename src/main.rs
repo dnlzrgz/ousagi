@@ -68,29 +68,60 @@ fn main() {
     rt.block_on(run(args));
 }
 
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install CTRL+C handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("received Ctrl+C"),
+        _ = terminate => tracing::info!("received SIGTERM"),
+    }
+}
+
 async fn run(args: Args) {
     let addr = resolve_addr(&args);
     let listener = TcpListener::bind(addr).await.unwrap();
     tracing::info!(addr = %addr, threads = args.threads, "listening");
 
     let store: Store = Arc::new(StoreInner::new());
-    loop {
-        let (socket, addr) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::warn!(error = %e, "accept failed");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-        };
-        tracing::info!(%addr, "connection accepted");
 
-        let store = store.clone();
-        tokio::spawn(async move {
-            match connection::process(socket, store).await {
-                Ok(()) => tracing::info!(%addr, "connection closed"),
-                Err(e) => tracing::warn!(%addr, error = %e, "connection error"),
+    loop {
+        tokio::select! {
+            accept_result = listener.accept() => {
+                let (socket, addr) = match accept_result {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "accept failed");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                tracing::info!(%addr, "connection accepted");
+                let store = store.clone();
+                tokio::spawn(async move {
+                    match connection::process(socket, store).await {
+                        Ok(()) => tracing::info!(%addr, "connection closed"),
+                        Err(e) => tracing::warn!(%addr, error = %e, "connection error"),
+                    }
+                });
             }
-        });
+            _ = shutdown_signal() => {
+                tracing::info!("shutdown signal received, exiting");
+                break;
+            }
+        }
     }
 }
