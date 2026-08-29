@@ -56,6 +56,10 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
     async fn read_line(&mut self) -> Result<Option<Bytes>, ReadLineError> {
         self.line.clear();
 
+        if self.reader.buffer().is_empty() {
+            self.writer.flush().await?;
+        }
+
         let n = {
             let mut limited = (&mut self.reader).take(MAX_LINE_LEN);
             limited.read_until(b'\n', &mut self.line).await?
@@ -183,7 +187,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
             }
         }
 
-        self.writer.flush().await
+        Ok(())
     }
 
     async fn discard_exact(&mut self, n: usize) -> io::Result<()> {
