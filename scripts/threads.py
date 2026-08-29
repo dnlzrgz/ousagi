@@ -12,7 +12,7 @@ BENCH = ROOT / "scripts" / "bench.py"
 
 def main():
     thread_counts = [int(t) for t in sys.argv[1:]] or [1, 4, 8]
-    run_dir = ROOT / "bench-results" / datetime.now().strftime("%Y%m%d%H%M%S")
+    run_dir = ROOT / "memtier_benchmark" / datetime.now().strftime("%Y%m%d%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
 
     for threads in thread_counts:

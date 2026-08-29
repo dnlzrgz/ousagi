@@ -9,10 +9,34 @@ use tokio::{
 };
 
 use crate::{
-    commands::{ArithmeticOp, Command, Response, StoreArgs, StoreOp},
-    parser::{parse_field, validate_key},
+    commands::{ArithmeticOp, Command, Response, StoreOp},
+    parser::{CommandHeader, parse_command_line},
     store::{Item, Store},
 };
+
+const MAX_LINE_LEN: u64 = 8 * 1024; // bytes
+
+enum ReadLineError {
+    Io(io::Error),
+    TooLong,
+}
+
+impl From<io::Error> for ReadLineError {
+    fn from(e: io::Error) -> Self {
+        ReadLineError::Io(e)
+    }
+}
+
+enum PayloadError {
+    Io(io::Error),
+    BadChunk,
+}
+
+impl From<io::Error> for PayloadError {
+    fn from(e: io::Error) -> Self {
+        PayloadError::Io(e)
+    }
+}
 
 pub(crate) struct Connection<R, W> {
     reader: BufReader<R>,
@@ -20,290 +44,103 @@ pub(crate) struct Connection<R, W> {
     line: Vec<u8>,
 }
 
-const MAX_ITEM_SIZE: usize = 1024 * 1024; // 1 MiB
-const MAX_LINE_LEN: u64 = 8 * 1024; // bytes
-
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
     fn new(reader: R, writer: W) -> Self {
         Connection {
             reader: BufReader::new(reader),
             writer: BufWriter::new(writer),
-            line: Vec::new(),
+            line: Vec::with_capacity(128),
         }
+    }
+
+    async fn read_line(&mut self) -> Result<Option<Bytes>, ReadLineError> {
+        self.line.clear();
+
+        let n = {
+            let mut limited = (&mut self.reader).take(MAX_LINE_LEN);
+            limited.read_until(b'\n', &mut self.line).await?
+        };
+
+        if n == 0 {
+            return Ok(None); // EOF
+        }
+
+        if self.line.last() != Some(&b'\n') {
+            if n as u64 == MAX_LINE_LEN {
+                return Err(ReadLineError::TooLong);
+            } else {
+                return Ok(None); // EOF without newline
+            }
+        }
+
+        while matches!(self.line.last(), Some(b'\n') | Some(b'\r')) {
+            self.line.pop();
+        }
+
+        let line = std::mem::replace(&mut self.line, Vec::with_capacity(128));
+        Ok(Some(Bytes::from(line)))
+    }
+
+    async fn read_payload(&mut self, len: usize) -> Result<Bytes, PayloadError> {
+        let mut data = BytesMut::with_capacity(len);
+        while data.len() < len {
+            if self.reader.read_buf(&mut data).await? == 0 {
+                return Err(PayloadError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed mid-payload",
+                )));
+            }
+        }
+
+        let mut crlf = [0u8; 2];
+        self.reader.read_exact(&mut crlf).await?;
+        if crlf != *b"\r\n" {
+            return Err(PayloadError::BadChunk);
+        }
+
+        Ok(data.freeze())
     }
 
     async fn read_command(&mut self) -> io::Result<Option<Command>> {
         loop {
-            self.line.clear();
-
-            let n = {
-                let mut limited = (&mut self.reader).take(MAX_LINE_LEN);
-                limited.read_until(b'\n', &mut self.line).await?
-            };
-
-            if n == 0 {
-                return Ok(None); // EOF
-            }
-
-            if self.line.last() != Some(&b'\n') {
-                if n as u64 == MAX_LINE_LEN {
-                    tracing::warn!("line exceeds {MAX_LINE_LEN} bytes");
+            let line = match self.read_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => return Ok(None),
+                Err(ReadLineError::TooLong) => {
                     self.discard_until_newline().await?;
                     self.write_response(&Response::ClientError("line too long"))
                         .await?;
                     continue;
-                } else {
-                    return Ok(None); // EOF
                 }
-            }
+                Err(ReadLineError::Io(e)) => return Err(e),
+            };
 
-            while matches!(self.line.last(), Some(b'\n') | Some(b'\r')) {
-                self.line.pop();
-            }
-
-            let parts: Vec<&[u8]> = self
-                .line
-                .split(|&b| b == b' ')
-                .filter(|s| !s.is_empty())
-                .collect();
-
-            match parts.as_slice() {
-                [op @ (b"get" | b"gets"), keys @ ..] if !keys.is_empty() => {
-                    let with_cas = *op == b"gets";
-
-                    let parsed: Result<Vec<Bytes>, ()> = keys
-                        .iter()
-                        .map(|k| {
-                            validate_key(k)?;
-                            Ok(Bytes::copy_from_slice(k))
-                        })
-                        .collect();
-
-                    match parsed {
-                        Ok(out) => {
-                            return Ok(Some(Command::Get {
-                                keys: out,
-                                with_cas,
-                            }));
-                        }
-                        Err(()) => {
-                            self.write_response(&Response::ClientError("bad command line format"))
-                                .await?;
-                            continue;
-                        }
+            let header = match parse_command_line(&line) {
+                Ok(header) => header,
+                Err(err) => {
+                    if let Some(n) = err.discard() {
+                        self.discard_exact(n).await?;
                     }
+
+                    self.write_response(&err.response()).await?;
+                    continue;
                 }
-                [
-                    op @ (b"add" | b"set" | b"replace" | b"append" | b"prepend" | b"cas"),
-                    key,
-                    flags,
-                    exptime,
-                    bytes_len,
-                    rest @ ..,
-                ] => {
-                    let store_op = match *op {
-                        b"add" => StoreOp::Add,
-                        b"replace" => StoreOp::Replace,
-                        b"set" => StoreOp::Set,
-                        b"append" => StoreOp::Append,
-                        b"prepend" => StoreOp::Prepend,
-                        b"cas" => StoreOp::Cas,
-                        _ => unreachable!(),
-                    };
-                    let Ok(bytes_len) = parse_field::<usize>(bytes_len) else {
-                        tracing::warn!(line = %&String::from_utf8_lossy(&self.line), "malformed byte length");
-                        self.write_response(&Response::ClientError("bad command line format"))
-                            .await?;
-                        return Ok(None);
-                    };
+            };
 
-                    if bytes_len > MAX_ITEM_SIZE {
-                        tracing::warn!(bytes_len, max = MAX_ITEM_SIZE, "item exceeds max size");
-                        self.discard_exact(bytes_len + 2).await?;
-                        self.write_response(&Response::ServerError("object too large for cache"))
-                            .await?;
-                        continue;
-                    }
-
-                    if validate_key(key).is_err() {
-                        tracing::warn!(key = %String::from_utf8_lossy(key), "invalid key");
-                        self.discard_exact(bytes_len + 2).await?;
-                        self.write_response(&Response::ClientError("bad command line format"))
-                            .await?;
-                        continue;
-                    }
-
-                    let (Ok(flags), Ok(exptime)) =
-                        (parse_field::<u32>(flags), parse_field::<i64>(exptime))
-                    else {
-                        tracing::warn!(line = %String::from_utf8_lossy(&self.line), "malformed flags/exptime");
-                        self.discard_exact(bytes_len + 2).await?;
-                        self.write_response(&Response::ClientError("bad command line format"))
-                            .await?;
-                        continue;
-                    };
-
-                    let mut data = BytesMut::zeroed(bytes_len);
-                    self.reader.read_exact(&mut data).await?;
-                    let data = data.freeze();
-
-                    let mut crlf = [0u8; 2];
-                    self.reader.read_exact(&mut crlf).await?;
-                    if crlf != *b"\r\n" {
-                        tracing::warn!("missing trailing CRLF after data block");
+            let command = match header {
+                CommandHeader::Immediate(cmd) => cmd,
+                CommandHeader::Store(pending) => match self.read_payload(pending.len).await {
+                    Ok(data) => pending.into_command(data),
+                    Err(PayloadError::BadChunk) => {
                         self.write_response(&Response::ClientError("bad data chunk"))
                             .await?;
                         continue;
                     }
+                    Err(PayloadError::Io(e)) => return Err(e),
+                },
+            };
 
-                    let (cas, rest) = if store_op == StoreOp::Cas {
-                        match rest {
-                            [cas_unique, rest @ ..] => {
-                                let Ok(cas_unique) = parse_field::<u64>(cas_unique) else {
-                                    self.write_response(&Response::ClientError(
-                                        "bad command line format",
-                                    ))
-                                    .await?;
-                                    continue;
-                                };
-                                (Some(cas_unique), rest)
-                            }
-                            [] => {
-                                self.write_response(&Response::ClientError(
-                                    "bad command line format",
-                                ))
-                                .await?;
-                                continue;
-                            }
-                        }
-                    } else {
-                        (None, rest)
-                    };
-
-                    let noreply = match rest {
-                        [] => false,
-                        [b"noreply"] => true,
-                        _ => {
-                            self.write_response(&Response::ClientError("bad command line format"))
-                                .await?;
-                            continue;
-                        }
-                    };
-
-                    return Ok(Some(Command::Store(
-                        store_op,
-                        StoreArgs {
-                            key: Bytes::copy_from_slice(key),
-                            flags,
-                            exptime,
-                            data,
-                            noreply,
-                            cas,
-                        },
-                    )));
-                }
-                [b"delete", key, rest @ ..] => {
-                    if validate_key(key).is_err() {
-                        self.write_response(&Response::ClientError("bad command line format"))
-                            .await?;
-                        continue;
-                    }
-
-                    let noreply = match rest {
-                        [] => false,
-                        [b"noreply"] => true,
-                        _ => {
-                            self.write_response(&Response::ClientError("bad command line format"))
-                                .await?;
-                            continue;
-                        }
-                    };
-
-                    return Ok(Some(Command::Delete {
-                        key: Bytes::copy_from_slice(key),
-                        noreply,
-                    }));
-                }
-                [arithmetic_op @ (b"incr" | b"decr"), key, delta, rest @ ..] => {
-                    let arithmetic_op = match *arithmetic_op {
-                        b"incr" => ArithmeticOp::Incr,
-                        b"decr" => ArithmeticOp::Decr,
-                        _ => unreachable!(),
-                    };
-
-                    if validate_key(key).is_err() {
-                        self.write_response(&Response::ClientError("bad command line format"))
-                            .await?;
-                        continue;
-                    }
-
-                    let Ok(delta) = parse_field::<u64>(delta) else {
-                        self.write_response(&Response::ClientError("invalid numeric delta"))
-                            .await?;
-                        continue;
-                    };
-
-                    let noreply = match rest {
-                        [] => false,
-                        [b"noreply"] => true,
-                        _ => {
-                            self.write_response(&Response::ClientError("bad command line format"))
-                                .await?;
-                            continue;
-                        }
-                    };
-
-                    return Ok(Some(Command::Arithmetic {
-                        op: arithmetic_op,
-                        key: Bytes::copy_from_slice(key),
-                        delta,
-                        noreply,
-                    }));
-                }
-                [b"flush_all", rest @ ..] => {
-                    let mut delay: Option<u32> = None;
-                    let mut noreply = false;
-                    match rest {
-                        [] => {}
-                        [b"noreply"] => noreply = true,
-                        [delay_token] => match parse_field::<u32>(delay_token) {
-                            Ok(d) => delay = Some(d),
-                            Err(_) => {
-                                self.write_response(&Response::ClientError(
-                                    "invalid numeric delay",
-                                ))
-                                .await?;
-                                continue;
-                            }
-                        },
-                        [delay_token, b"noreply"] => {
-                            match parse_field::<u32>(delay_token) {
-                                Ok(d) => delay = Some(d),
-                                Err(_) => {
-                                    self.write_response(&Response::ClientError(
-                                        "invalid numeric delay",
-                                    ))
-                                    .await?;
-                                    continue;
-                                }
-                            }
-                            noreply = true;
-                        }
-                        _ => {
-                            self.write_response(&Response::ClientError("bad command line format"))
-                                .await?;
-                            continue;
-                        }
-                    };
-
-                    return Ok(Some(Command::FlushAll { delay, noreply }));
-                }
-                _ => {
-                    tracing::warn!(line = %String::from_utf8_lossy(&self.line), "unrecognized command");
-                    self.write_response(&Response::Error).await?;
-                    continue;
-                }
-            }
+            return Ok(Some(command));
         }
     }
 
@@ -585,6 +422,7 @@ pub async fn process(socket: TcpStream, store: Store) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::StoreArgs;
     use crate::store::StoreInner;
     use bytes::Bytes;
     use std::sync::Arc;
