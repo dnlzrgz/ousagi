@@ -5,7 +5,7 @@ use ousagi::{
     connection,
     store::{Store, StoreInner},
 };
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::Semaphore};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -21,6 +21,10 @@ pub struct Args {
     /// Number of threads to process incoming requests
     #[arg(short = 't', long, default_value_t = 4, value_parser = parse_threads)]
     pub threads: usize,
+
+    /// Max simultaneous client connections
+    #[arg(short = 'c', long, default_value_t = 1024)]
+    pub max_connections: usize,
 
     /// Verbosity level
     #[arg(short = 'v', action = ArgAction::Count)]
@@ -97,31 +101,41 @@ async fn run(args: Args) {
     tracing::info!(addr = %addr, threads = args.threads, "listening");
 
     let store: Store = Arc::new(StoreInner::new());
+    let connections = Arc::new(Semaphore::new(args.max_connections));
 
-    loop {
-        tokio::select! {
-            accept_result = listener.accept() => {
-                let (socket, addr) = match accept_result {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "accept failed");
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        continue;
-                    }
-                };
-                tracing::info!(%addr, "connection accepted");
-                let store = store.clone();
-                tokio::spawn(async move {
-                    match connection::process(socket, store).await {
-                        Ok(()) => tracing::info!(%addr, "connection closed"),
-                        Err(e) => tracing::warn!(%addr, error = %e, "connection error"),
-                    }
-                });
-            }
-            _ = shutdown_signal() => {
-                tracing::info!("shutdown signal received, exiting");
-                break;
-            }
+    tokio::select! {
+        _ = accept_loop(listener, store, connections) => {}
+        _ = shutdown_signal() => {
+            tracing::info!("shutdown signal received, exiting");
         }
+    }
+}
+
+async fn accept_loop(listener: TcpListener, store: Store, connections: Arc<Semaphore>) {
+    loop {
+        let permit = connections
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore is never closed");
+
+        let (socket, addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(error = %e, "accept failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+
+        tracing::info!(%addr, "connection accepted");
+        let store = store.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            match connection::process(socket, store).await {
+                Ok(()) => tracing::info!(%addr, "connection closed"),
+                Err(e) => tracing::warn!(%addr, error = %e, "connection error"),
+            }
+        });
     }
 }
