@@ -16,6 +16,10 @@ services:
       - no-new-privileges:true
     tmpfs:
       - /tmp
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
     networks:
       - bench
 
@@ -30,6 +34,7 @@ services:
       --clients=50 --threads=4
       --data-size=128 --ratio=1:10
       --key-pattern=R:R
+      --key-minimum=1 --key-maximum=100000
       --test-time=30
       --print-percentiles=50,90,99,99.9
 

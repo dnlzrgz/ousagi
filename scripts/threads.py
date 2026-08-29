@@ -11,7 +11,7 @@ BENCH = ROOT / "scripts" / "bench.py"
 
 
 def main():
-    thread_counts = [int(t) for t in sys.argv[1:]] or [1, 4, 8]
+    thread_counts = [int(t) for t in sys.argv[1:]] or [1, 4]
     run_dir = ROOT / "memtier_benchmark" / datetime.now().strftime("%Y%m%d%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -21,7 +21,13 @@ def main():
         env = os.environ.copy()
         env["OUSAGI_THREADS"] = str(threads)
         with log_file.open("w") as f:
-            subprocess.run([sys.executable, str(BENCH)], env=env, stdout=f, check=True)
+            subprocess.run(
+                [sys.executable, str(BENCH)],
+                env=env,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                check=True,
+            )
 
     print(f"==> Done. Results saved under {run_dir}/", file=sys.stderr)
 
