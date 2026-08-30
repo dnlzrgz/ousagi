@@ -1,6 +1,7 @@
-use std::{collections::hash_map::Entry, io, time::SystemTime};
+use std::{io, time::SystemTime};
 
 use bytes::{Bytes, BytesMut};
+use dashmap::Entry;
 use tokio::{
     io::{
         AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
@@ -156,7 +157,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
             Response::NotFound => self.writer.write_all(b"NOT_FOUND\r\n").await?,
             Response::Exists => self.writer.write_all(b"EXISTS\r\n").await?,
             Response::Number(val) => {
-                self.writer.write_all(val.to_string().as_bytes()).await?;
+                let mut buf = itoa::Buffer::new();
+                self.writer.write_all(buf.format(*val).as_bytes()).await?;
                 self.writer.write_all(b"\r\n").await?;
             }
             Response::Error => self.writer.write_all(b"ERROR\r\n").await?,
@@ -172,14 +174,28 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                 self.writer.write_all(b"\r\n").await?;
             }
             Response::Values(values) => {
+                let mut itoa_buf = itoa::Buffer::new();
+
                 for (key, flags, data, cas) in values {
                     self.writer.write_all(b"VALUE ").await?;
                     self.writer.write_all(key).await?;
-                    let meta = match cas {
-                        Some(cas) => format!(" {flags} {} {cas}\r\n", data.len()),
-                        None => format!(" {flags} {}\r\n", data.len()),
-                    };
-                    self.writer.write_all(meta.as_bytes()).await?;
+                    self.writer.write_all(b" ").await?;
+                    self.writer
+                        .write_all(itoa_buf.format(*flags).as_bytes())
+                        .await?;
+                    self.writer.write_all(b" ").await?;
+                    self.writer
+                        .write_all(itoa_buf.format(data.len()).as_bytes())
+                        .await?;
+
+                    if let Some(c) = cas {
+                        self.writer.write_all(b" ").await?;
+                        self.writer
+                            .write_all(itoa_buf.format(*c).as_bytes())
+                            .await?;
+                    }
+
+                    self.writer.write_all(b"\r\n").await?;
                     self.writer.write_all(data).await?;
                     self.writer.write_all(b"\r\n").await?;
                 }
@@ -222,9 +238,8 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
             let mut values = Vec::new();
 
             {
-                let items = store.items.read();
                 for key in keys {
-                    match items.get(&key) {
+                    match store.items.get(&key) {
                         Some(item) if item.is_expired(now, oldest_live) => expired_keys.push(key),
                         Some(item) => {
                             let cas = with_cas.then(|| item.cas());
@@ -236,9 +251,8 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
             }
 
             if !expired_keys.is_empty() {
-                let mut items = store.items.write();
                 for key in expired_keys {
-                    if let Entry::Occupied(entry) = items.entry(key)
+                    if let Entry::Occupied(entry) = store.items.entry(key)
                         && entry.get().is_expired(now, oldest_live)
                     {
                         entry.remove();
@@ -253,10 +267,9 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
 
             let oldest_live = store.oldest_live();
             let cas = store.next_cas();
-            let mut items = store.items.write();
 
             match op {
-                StoreOp::Add => match items.entry(args.key) {
+                StoreOp::Add => match store.items.entry(args.key) {
                     Entry::Occupied(entry) if !entry.get().is_expired(now, oldest_live) => {
                         Response::NotStored
                     }
@@ -271,17 +284,17 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
                 },
                 StoreOp::Set => {
                     let item = Item::new(args.data, args.flags, args.exptime, cas);
-                    items.insert(args.key, item);
+                    store.items.insert(args.key, item);
                     Response::Stored
                 }
-                StoreOp::Replace => match items.entry(args.key) {
+                StoreOp::Replace => match store.items.entry(args.key) {
                     Entry::Occupied(mut entry) if !entry.get().is_expired(now, oldest_live) => {
                         entry.insert(Item::new(args.data, args.flags, args.exptime, cas));
                         Response::Stored
                     }
                     _ => Response::NotStored,
                 },
-                StoreOp::Append | StoreOp::Prepend => match items.entry(args.key) {
+                StoreOp::Append | StoreOp::Prepend => match store.items.entry(args.key) {
                     Entry::Occupied(mut entry) if !entry.get().is_expired(now, oldest_live) => {
                         let old_item = entry.get();
 
@@ -309,7 +322,7 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
                     }
                     _ => Response::NotStored,
                 },
-                StoreOp::Cas => match items.entry(args.key) {
+                StoreOp::Cas => match store.items.entry(args.key) {
                     Entry::Occupied(mut entry) if !entry.get().is_expired(now, oldest_live) => {
                         if entry.get().cas() != args.cas.unwrap() {
                             tracing::debug!(
@@ -330,9 +343,8 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
         }
         Command::Delete { key, noreply: _ } => {
             tracing::debug!(?key, "delete");
-            let mut items = store.items.write();
 
-            match items.remove(&key) {
+            match store.items.remove(&key) {
                 Some(_) => Response::Deleted,
                 None => Response::NotFound,
             }
@@ -347,14 +359,12 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
 
             let oldest_live = store.oldest_live();
             let cas = store.next_cas();
-            let mut items = store.items.write();
-
             let error = match op {
                 ArithmeticOp::Incr => "cannot increment non-numeric value",
                 ArithmeticOp::Decr => "cannot decrement non-numeric value",
             };
 
-            match items.entry(key) {
+            match store.items.entry(key) {
                 Entry::Occupied(mut entry) if !entry.get().is_expired(now, oldest_live) => {
                     let old_item = entry.get();
 
@@ -389,17 +399,12 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
         Command::FlushAll { delay, noreply: _ } => {
             tracing::debug!(?delay, "flush_all");
 
-            let mut items = store.items.write();
             match delay {
-                Some(0) => {
-                    items.clear();
+                Some(0) | None => {
+                    store.items.clear();
                 }
                 Some(n) => {
                     store.flush_all(n);
-                }
-                None => {
-                    items.clear();
-                    return Response::Ok;
                 }
             }
 
@@ -442,7 +447,6 @@ mod tests {
         let inner = StoreInner::new();
         inner
             .items
-            .write()
             .insert(Bytes::copy_from_slice(key.as_bytes()), item);
         Arc::new(inner)
     }
@@ -542,8 +546,7 @@ mod tests {
             other => panic!("expected Values, got {:?}", other),
         }
 
-        let items = store.items.read();
-        assert!(items.get("foo".as_bytes()).is_none());
+        assert!(store.items.get("foo".as_bytes()).is_none());
     }
 
     #[test]
@@ -584,8 +587,8 @@ mod tests {
         let resp = execute(cmd, &store);
         assert!(matches!(resp, Response::NotStored));
 
-        let items = store.items.read();
-        let item = items
+        let item = store
+            .items
             .get("foo".as_bytes())
             .expect("key should still be present");
         assert_eq!(item.data().as_ref(), b"hello");
@@ -631,8 +634,8 @@ mod tests {
         let resp = execute(cmd, &store);
         assert!(matches!(resp, Response::Stored));
 
-        let items = store.items.read();
-        let item = items
+        let item = store
+            .items
             .get("foo".as_bytes())
             .expect("key should still be present");
         assert_eq!(item.data().as_ref(), b"jello");
@@ -699,8 +702,7 @@ mod tests {
         let resp = execute(cmd, &store);
         assert!(matches!(resp, Response::Stored));
 
-        let items = store.items.read();
-        let item = items.get("foo".as_bytes()).unwrap();
+        let item = store.items.get("foo".as_bytes()).unwrap();
         assert_eq!(item.data().as_ref(), b"hello");
         assert_eq!(item.flags(), 42);
     }
@@ -723,8 +725,7 @@ mod tests {
         let resp = execute(cmd, &store);
         assert!(matches!(resp, Response::Stored));
 
-        let items = store.items.read();
-        let item = items.get("foo".as_bytes()).unwrap();
+        let item = store.items.get("foo".as_bytes()).unwrap();
         assert_eq!(item.data().as_ref(), b"jello");
         assert_eq!(item.flags(), 21);
     }
@@ -740,8 +741,7 @@ mod tests {
         let resp = execute(cmd, &store);
         assert!(matches!(resp, Response::Deleted));
 
-        let items = store.items.read();
-        assert!(items.get("foo".as_bytes()).is_none());
+        assert!(store.items.get("foo".as_bytes()).is_none());
     }
 
     #[test]
@@ -755,8 +755,7 @@ mod tests {
         let resp = execute(cmd, &store);
         assert!(matches!(resp, Response::NotFound));
 
-        let items = store.items.read();
-        assert!(items.get("foo".as_bytes()).is_some());
+        assert!(store.items.get("foo".as_bytes()).is_some());
     }
 
     #[test]
@@ -772,8 +771,8 @@ mod tests {
         let resp = execute(cmd, &store);
         assert!(matches!(resp, Response::Number(15)));
 
-        let items = store.items.read();
-        let item = items
+        let item = store
+            .items
             .get("foo".as_bytes())
             .expect("key should still be present");
         assert_eq!(item.data().as_ref(), b"15");
@@ -809,8 +808,8 @@ mod tests {
         let resp = execute(cmd, &store);
         assert!(matches!(resp, Response::Number(0)));
 
-        let items = store.items.read();
-        let item = items
+        let item = store
+            .items
             .get("foo".as_bytes())
             .expect("key should still be present");
         assert_eq!(item.data().as_ref(), b"0");
@@ -829,8 +828,8 @@ mod tests {
         let resp = execute(cmd, &store);
         assert!(matches!(resp, Response::Number(5)));
 
-        let items = store.items.read();
-        let item = items
+        let item = store
+            .items
             .get("foo".as_bytes())
             .expect("key should still be present");
         assert_eq!(item.data().as_ref(), b"5");
@@ -863,8 +862,8 @@ mod tests {
         let resp = execute(cmd, &store);
         assert!(matches!(resp, Response::Number(0)));
 
-        let items = store.items.read();
-        let item = items
+        let item = store
+            .items
             .get("foo".as_bytes())
             .expect("key should still be present");
         assert_eq!(item.data().as_ref(), b"0");
@@ -881,8 +880,7 @@ mod tests {
         let resp = execute(cmd, &store);
         assert!(matches!(resp, Response::Ok));
 
-        let items = store.items.read();
-        assert!(items.is_empty());
+        assert!(store.items.is_empty());
     }
 
     #[test]
@@ -896,8 +894,8 @@ mod tests {
         let resp = execute(cmd, &store);
         assert!(matches!(resp, Response::Ok));
 
-        let items = store.items.read();
-        let item = items
+        let item = store
+            .items
             .get("foo".as_bytes())
             .expect("key should still be present");
         assert_eq!(item.data().as_ref(), b"0");

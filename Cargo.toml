@@ -1,6 +1,6 @@
 [package]
 name = "ousagi"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 
 [dependencies]
@@ -9,7 +9,8 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tokio = { version = "1.53.1", features = ["full"] }
 bytes = "1.12.1"
-parking_lot = "0.12.5"
+itoa = "1.0.18"
+dashmap = "6.2.1"
 
 [dev-dependencies]
 criterion = {version="0.8.2", features=["html_reports"]}

@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -8,7 +7,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use parking_lot::RwLock;
+use dashmap::DashMap;
 
 const THIRTY_DAYS_SECS: i64 = 60 * 60 * 24 * 30;
 
@@ -93,7 +92,7 @@ impl Item {
 }
 
 pub struct StoreInner {
-    pub items: RwLock<HashMap<Bytes, Item>>,
+    pub items: DashMap<Bytes, Item>,
     next_cas: AtomicU64,
     oldest_live: AtomicU64,
 }
@@ -101,7 +100,7 @@ pub struct StoreInner {
 impl StoreInner {
     pub fn new() -> Self {
         Self {
-            items: RwLock::new(HashMap::new()),
+            items: DashMap::new(),
             next_cas: AtomicU64::new(1),
             oldest_live: AtomicU64::new(0),
         }
