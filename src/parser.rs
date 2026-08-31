@@ -1,3 +1,4 @@
+use atoi::FromRadix10SignedChecked;
 use bytes::Bytes;
 
 use crate::commands::{ArithmeticOp, Command, Response, StoreArgs, StoreOp};
@@ -78,28 +79,25 @@ pub enum CommandHeader {
 }
 
 pub fn parse_command_line(line: &Bytes) -> Result<CommandHeader, ParseError> {
-    let parts: Vec<&[u8]> = line
-        .split(|&b| b == b' ')
-        .filter(|s| !s.is_empty())
-        .collect();
+    let mut tokens = line.split(|&b| b == b' ').filter(|s| !s.is_empty());
 
-    match parts.as_slice() {
-        [op @ (b"get" | b"gets"), keys @ ..] if !keys.is_empty() => {
-            parse_get(*op == b"gets", keys, line)
-        }
-        [
-            op @ (b"add" | b"set" | b"replace" | b"append" | b"prepend" | b"cas"),
-            key,
-            flags,
-            exptime,
-            len,
-            rest @ ..,
-        ] => parse_store(op, key, flags, exptime, len, rest, line),
-        [b"delete", key, rest @ ..] => parse_delete(key, rest, line),
-        [op @ (b"incr" | b"decr"), key, delta, rest @ ..] => {
-            parse_arithmetic(op, key, delta, rest, line)
-        }
-        [b"flush_all", rest @ ..] => parse_flush_all(rest),
+    let op = match tokens.next() {
+        Some(op) => op,
+        None => return Err(ParseError::new(ParseErrorKind::Unknown)),
+    };
+
+    match op {
+        b"get" | b"gets" => parse_get(op == b"gets", tokens, line),
+        b"add" => parse_store(StoreOp::Add, tokens, line),
+        b"set" => parse_store(StoreOp::Set, tokens, line),
+        b"replace" => parse_store(StoreOp::Replace, tokens, line),
+        b"append" => parse_store(StoreOp::Append, tokens, line),
+        b"prepend" => parse_store(StoreOp::Prepend, tokens, line),
+        b"cas" => parse_store(StoreOp::Cas, tokens, line),
+        b"delete" => parse_delete(tokens, line),
+        b"incr" => parse_arithmetic(ArithmeticOp::Incr, tokens, line),
+        b"decr" => parse_arithmetic(ArithmeticOp::Decr, tokens, line),
+        b"flush_all" => parse_flush_all(tokens),
         _ => Err(ParseError::new(ParseErrorKind::Unknown)),
     }
 }
@@ -116,11 +114,14 @@ fn validate_key(key: &[u8]) -> Result<(), ()> {
     Ok(())
 }
 
-fn parse_field<T: std::str::FromStr>(tok: &[u8]) -> Result<T, ()> {
-    std::str::from_utf8(tok)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or(())
+/// Parse a field (e.g. flags) directly from ASCII bytes.
+fn parse_field<T: FromRadix10SignedChecked>(tok: &[u8]) -> Result<T, ()> {
+    let (value, used) = T::from_radix_10_signed_checked(tok);
+    if used == tok.len() {
+        value.ok_or(())
+    } else {
+        Err(())
+    }
 }
 
 fn parse_key(key: &[u8], line: &Bytes) -> Result<Bytes, ParseError> {
@@ -128,41 +129,45 @@ fn parse_key(key: &[u8], line: &Bytes) -> Result<Bytes, ParseError> {
     Ok(line.slice_ref(key))
 }
 
-fn parse_noreply(rest: &[&[u8]]) -> Result<bool, ParseError> {
-    match rest {
-        [] => Ok(false),
-        [b"noreply"] => Ok(true),
+fn parse_noreply<'a>(mut rest: impl Iterator<Item = &'a [u8]>) -> Result<bool, ParseError> {
+    match rest.next() {
+        None => Ok(false),
+        Some(b"noreply") if rest.next().is_none() => Ok(true),
         _ => Err(ParseError::new(ParseErrorKind::BadFormat)),
     }
 }
 
-fn parse_get(with_cas: bool, keys: &[&[u8]], line: &Bytes) -> Result<CommandHeader, ParseError> {
-    let keys = keys
-        .iter()
+fn parse_get<'a>(
+    with_cas: bool,
+    tokens: impl Iterator<Item = &'a [u8]>,
+    line: &Bytes,
+) -> Result<CommandHeader, ParseError> {
+    let mut tokens = tokens.peekable();
+    if tokens.peek().is_none() {
+        return Err(ParseError::new(ParseErrorKind::Unknown));
+    }
+
+    let keys = tokens
         .map(|k| parse_key(k, line))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(CommandHeader::Immediate(Command::Get { keys, with_cas }))
 }
 
-fn parse_store(
-    op: &[u8],
-    key: &[u8],
-    flags: &[u8],
-    exptime: &[u8],
-    len: &[u8],
-    rest: &[&[u8]],
+fn parse_store<'a>(
+    op: StoreOp,
+    mut tokens: impl Iterator<Item = &'a [u8]>,
     line: &Bytes,
 ) -> Result<CommandHeader, ParseError> {
-    let op = match op {
-        b"add" => StoreOp::Add,
-        b"set" => StoreOp::Set,
-        b"replace" => StoreOp::Replace,
-        b"append" => StoreOp::Append,
-        b"prepend" => StoreOp::Prepend,
-        b"cas" => StoreOp::Cas,
-        _ => unreachable!("guarded by the calling match arm"),
-    };
+    // If any of these four required tokens is missing, the old slice
+    // pattern (`[op, key, flags, exptime, len, rest @ ..]`) would have
+    // failed to match at all and fallen through to the catch-all Unknown
+    // arm, never reaching field validation. Preserve that here.
+    let (key, flags, exptime, len) =
+        match (tokens.next(), tokens.next(), tokens.next(), tokens.next()) {
+            (Some(key), Some(flags), Some(exptime), Some(len)) => (key, flags, exptime, len),
+            _ => return Err(ParseError::new(ParseErrorKind::Unknown)),
+        };
 
     let key = parse_key(key, line)?;
     let flags =
@@ -175,21 +180,20 @@ fn parse_store(
         return Err(ParseError::new(ParseErrorKind::TooLarge).with_discard(len + 2));
     }
 
-    let (cas, rest) = if op == StoreOp::Cas {
-        match rest {
-            [cas_token, rest @ ..] => {
-                let cas = parse_field::<u64>(cas_token).map_err(|_| {
+    let cas = if op == StoreOp::Cas {
+        match tokens.next() {
+            Some(cas_token) => {
+                Some(parse_field::<u64>(cas_token).map_err(|_| {
                     ParseError::new(ParseErrorKind::BadFormat).with_discard(len + 2)
-                })?;
-                (Some(cas), rest)
+                })?)
             }
-            [] => return Err(ParseError::new(ParseErrorKind::BadFormat).with_discard(len + 2)),
+            None => return Err(ParseError::new(ParseErrorKind::BadFormat).with_discard(len + 2)),
         }
     } else {
-        (None, rest)
+        None
     };
 
-    let noreply = parse_noreply(rest).map_err(|e| e.with_discard(len + 2))?;
+    let noreply = parse_noreply(tokens).map_err(|e| e.with_discard(len + 2))?;
 
     Ok(CommandHeader::Store(PendingStore {
         op,
@@ -202,28 +206,34 @@ fn parse_store(
     }))
 }
 
-fn parse_delete(key: &[u8], rest: &[&[u8]], line: &Bytes) -> Result<CommandHeader, ParseError> {
+fn parse_delete<'a>(
+    mut tokens: impl Iterator<Item = &'a [u8]>,
+    line: &Bytes,
+) -> Result<CommandHeader, ParseError> {
+    let key = match tokens.next() {
+        Some(key) => key,
+        None => return Err(ParseError::new(ParseErrorKind::Unknown)),
+    };
+
     let key = parse_key(key, line)?;
-    let noreply = parse_noreply(rest)?;
+    let noreply = parse_noreply(tokens)?;
     Ok(CommandHeader::Immediate(Command::Delete { key, noreply }))
 }
 
-fn parse_arithmetic(
-    op: &[u8],
-    key: &[u8],
-    delta: &[u8],
-    rest: &[&[u8]],
+fn parse_arithmetic<'a>(
+    op: ArithmeticOp,
+    mut tokens: impl Iterator<Item = &'a [u8]>,
     line: &Bytes,
 ) -> Result<CommandHeader, ParseError> {
-    let op = if op == b"incr" {
-        ArithmeticOp::Incr
-    } else {
-        ArithmeticOp::Decr
+    let (key, delta) = match (tokens.next(), tokens.next()) {
+        (Some(key), Some(delta)) => (key, delta),
+        _ => return Err(ParseError::new(ParseErrorKind::Unknown)),
     };
+
     let key = parse_key(key, line)?;
     let delta =
         parse_field::<u64>(delta).map_err(|_| ParseError::new(ParseErrorKind::NumericDelta))?;
-    let noreply = parse_noreply(rest)?;
+    let noreply = parse_noreply(tokens)?;
 
     Ok(CommandHeader::Immediate(Command::Arithmetic {
         op,
@@ -233,16 +243,22 @@ fn parse_arithmetic(
     }))
 }
 
-fn parse_flush_all(rest: &[&[u8]]) -> Result<CommandHeader, ParseError> {
-    let (delay, rest) = match rest {
-        [d, tail @ ..] if *d != b"noreply" => {
+fn parse_flush_all<'a>(
+    tokens: impl Iterator<Item = &'a [u8]>,
+) -> Result<CommandHeader, ParseError> {
+    let mut tokens = tokens.peekable();
+
+    let delay = match tokens.peek() {
+        Some(&d) if d != b"noreply" => {
             let delay =
                 parse_field::<u32>(d).map_err(|_| ParseError::new(ParseErrorKind::NumericDelay))?;
-            (Some(delay), tail)
+            tokens.next(); // consume the delay token now that it parsed successfully
+            Some(delay)
         }
-        _ => (None, rest),
+        _ => None,
     };
-    let noreply = parse_noreply(rest)?;
+
+    let noreply = parse_noreply(tokens)?;
 
     Ok(CommandHeader::Immediate(Command::FlushAll {
         delay,
