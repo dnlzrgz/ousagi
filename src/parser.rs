@@ -78,26 +78,71 @@ pub enum CommandHeader {
     Store(PendingStore),
 }
 
-pub fn parse_command_line(line: &Bytes) -> Result<CommandHeader, ParseError> {
-    let mut tokens = line.split(|&b| b == b' ').filter(|s| !s.is_empty());
+pub struct Tokenizer<'a> {
+    line: &'a Bytes,
+    rest: &'a [u8],
+}
 
-    let op = match tokens.next() {
+impl<'a> Tokenizer<'a> {
+    pub fn new(line: &'a Bytes) -> Self {
+        Self {
+            line,
+            rest: line.as_ref(),
+        }
+    }
+
+    /// Helper to extract and validate zero-copy keys.
+    #[inline]
+    pub fn extract_key(&self, key: &[u8]) -> Result<Bytes, ParseError> {
+        validate_key(key).map_err(|_| ParseError::new(ParseErrorKind::BadFormat))?;
+        Ok(self.line.slice_ref(key))
+    }
+}
+
+impl<'a> Iterator for Tokenizer<'a> {
+    type Item = &'a [u8];
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((&b' ', rem)) = self.rest.split_first() {
+            self.rest = rem;
+        }
+
+        if self.rest.is_empty() {
+            return None;
+        }
+
+        let pos = self
+            .rest
+            .iter()
+            .position(|&b| b == b' ')
+            .unwrap_or(self.rest.len());
+        let token = &self.rest[..pos];
+        self.rest = &self.rest[pos..];
+        Some(token)
+    }
+}
+
+pub fn parse_command_line(line: &Bytes) -> Result<CommandHeader, ParseError> {
+    let mut tokenizer = Tokenizer::new(line);
+
+    let op = match tokenizer.next() {
         Some(op) => op,
         None => return Err(ParseError::new(ParseErrorKind::Unknown)),
     };
 
     match op {
-        b"get" | b"gets" => parse_get(op == b"gets", tokens, line),
-        b"add" => parse_store(StoreOp::Add, tokens, line),
-        b"set" => parse_store(StoreOp::Set, tokens, line),
-        b"replace" => parse_store(StoreOp::Replace, tokens, line),
-        b"append" => parse_store(StoreOp::Append, tokens, line),
-        b"prepend" => parse_store(StoreOp::Prepend, tokens, line),
-        b"cas" => parse_store(StoreOp::Cas, tokens, line),
-        b"delete" => parse_delete(tokens, line),
-        b"incr" => parse_arithmetic(ArithmeticOp::Incr, tokens, line),
-        b"decr" => parse_arithmetic(ArithmeticOp::Decr, tokens, line),
-        b"flush_all" => parse_flush_all(tokens),
+        b"get" | b"gets" => parse_get(op == b"gets", &mut tokenizer),
+        b"add" => parse_store(StoreOp::Add, &mut tokenizer),
+        b"set" => parse_store(StoreOp::Set, &mut tokenizer),
+        b"replace" => parse_store(StoreOp::Replace, &mut tokenizer),
+        b"append" => parse_store(StoreOp::Append, &mut tokenizer),
+        b"prepend" => parse_store(StoreOp::Prepend, &mut tokenizer),
+        b"cas" => parse_store(StoreOp::Cas, &mut tokenizer),
+        b"delete" => parse_delete(&mut tokenizer),
+        b"incr" => parse_arithmetic(ArithmeticOp::Incr, &mut tokenizer),
+        b"decr" => parse_arithmetic(ArithmeticOp::Decr, &mut tokenizer),
+        b"flush_all" => parse_flush_all(&mut tokenizer),
         _ => Err(ParseError::new(ParseErrorKind::Unknown)),
     }
 }
@@ -115,6 +160,7 @@ fn validate_key(key: &[u8]) -> Result<(), ()> {
 }
 
 /// Parse a field (e.g. flags) directly from ASCII bytes.
+#[inline]
 fn parse_field<T: FromRadix10SignedChecked>(tok: &[u8]) -> Result<T, ()> {
     let (value, used) = T::from_radix_10_signed_checked(tok);
     if used == tok.len() {
@@ -124,52 +170,42 @@ fn parse_field<T: FromRadix10SignedChecked>(tok: &[u8]) -> Result<T, ()> {
     }
 }
 
-fn parse_key(key: &[u8], line: &Bytes) -> Result<Bytes, ParseError> {
-    validate_key(key).map_err(|_| ParseError::new(ParseErrorKind::BadFormat))?;
-    Ok(line.slice_ref(key))
-}
-
-fn parse_noreply<'a>(mut rest: impl Iterator<Item = &'a [u8]>) -> Result<bool, ParseError> {
-    match rest.next() {
+#[inline]
+fn parse_noreply(tokenizer: &mut Tokenizer) -> Result<bool, ParseError> {
+    match tokenizer.next() {
         None => Ok(false),
-        Some(b"noreply") if rest.next().is_none() => Ok(true),
+        Some(b"noreply") if tokenizer.next().is_none() => Ok(true),
         _ => Err(ParseError::new(ParseErrorKind::BadFormat)),
     }
 }
 
-fn parse_get<'a>(
-    with_cas: bool,
-    tokens: impl Iterator<Item = &'a [u8]>,
-    line: &Bytes,
-) -> Result<CommandHeader, ParseError> {
-    let mut tokens = tokens.peekable();
-    if tokens.peek().is_none() {
-        return Err(ParseError::new(ParseErrorKind::Unknown));
-    }
+fn parse_get(with_cas: bool, tokenizer: &mut Tokenizer) -> Result<CommandHeader, ParseError> {
+    let first_key = match tokenizer.next() {
+        Some(k) => k,
+        None => return Err(ParseError::new(ParseErrorKind::Unknown)),
+    };
 
-    let keys = tokens
-        .map(|k| parse_key(k, line))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut keys = Vec::new();
+    keys.push(tokenizer.extract_key(first_key)?);
+    while let Some(k) = tokenizer.next() {
+        keys.push(tokenizer.extract_key(k)?);
+    }
 
     Ok(CommandHeader::Immediate(Command::Get { keys, with_cas }))
 }
 
-fn parse_store<'a>(
-    op: StoreOp,
-    mut tokens: impl Iterator<Item = &'a [u8]>,
-    line: &Bytes,
-) -> Result<CommandHeader, ParseError> {
-    // If any of these four required tokens is missing, the old slice
-    // pattern (`[op, key, flags, exptime, len, rest @ ..]`) would have
-    // failed to match at all and fallen through to the catch-all Unknown
-    // arm, never reaching field validation. Preserve that here.
-    let (key, flags, exptime, len) =
-        match (tokens.next(), tokens.next(), tokens.next(), tokens.next()) {
-            (Some(key), Some(flags), Some(exptime), Some(len)) => (key, flags, exptime, len),
-            _ => return Err(ParseError::new(ParseErrorKind::Unknown)),
-        };
+fn parse_store(op: StoreOp, tokenizer: &mut Tokenizer) -> Result<CommandHeader, ParseError> {
+    let (key, flags, exptime, len) = match (
+        tokenizer.next(),
+        tokenizer.next(),
+        tokenizer.next(),
+        tokenizer.next(),
+    ) {
+        (Some(key), Some(flags), Some(exptime), Some(len)) => (key, flags, exptime, len),
+        _ => return Err(ParseError::new(ParseErrorKind::Unknown)),
+    };
 
-    let key = parse_key(key, line)?;
+    let key = tokenizer.extract_key(key)?;
     let flags =
         parse_field::<u32>(flags).map_err(|_| ParseError::new(ParseErrorKind::BadFormat))?;
     let exptime =
@@ -181,7 +217,7 @@ fn parse_store<'a>(
     }
 
     let cas = if op == StoreOp::Cas {
-        match tokens.next() {
+        match tokenizer.next() {
             Some(cas_token) => {
                 Some(parse_field::<u64>(cas_token).map_err(|_| {
                     ParseError::new(ParseErrorKind::BadFormat).with_discard(len + 2)
@@ -193,7 +229,7 @@ fn parse_store<'a>(
         None
     };
 
-    let noreply = parse_noreply(tokens).map_err(|e| e.with_discard(len + 2))?;
+    let noreply = parse_noreply(tokenizer).map_err(|e| e.with_discard(len + 2))?;
 
     Ok(CommandHeader::Store(PendingStore {
         op,
@@ -206,34 +242,31 @@ fn parse_store<'a>(
     }))
 }
 
-fn parse_delete<'a>(
-    mut tokens: impl Iterator<Item = &'a [u8]>,
-    line: &Bytes,
-) -> Result<CommandHeader, ParseError> {
-    let key = match tokens.next() {
+fn parse_delete(tokenizer: &mut Tokenizer) -> Result<CommandHeader, ParseError> {
+    let key = match tokenizer.next() {
         Some(key) => key,
         None => return Err(ParseError::new(ParseErrorKind::Unknown)),
     };
 
-    let key = parse_key(key, line)?;
-    let noreply = parse_noreply(tokens)?;
+    let key = tokenizer.extract_key(key)?;
+    let noreply = parse_noreply(tokenizer)?;
+
     Ok(CommandHeader::Immediate(Command::Delete { key, noreply }))
 }
 
-fn parse_arithmetic<'a>(
+fn parse_arithmetic(
     op: ArithmeticOp,
-    mut tokens: impl Iterator<Item = &'a [u8]>,
-    line: &Bytes,
+    tokenizer: &mut Tokenizer,
 ) -> Result<CommandHeader, ParseError> {
-    let (key, delta) = match (tokens.next(), tokens.next()) {
+    let (key, delta) = match (tokenizer.next(), tokenizer.next()) {
         (Some(key), Some(delta)) => (key, delta),
         _ => return Err(ParseError::new(ParseErrorKind::Unknown)),
     };
 
-    let key = parse_key(key, line)?;
+    let key = tokenizer.extract_key(key)?;
     let delta =
         parse_field::<u64>(delta).map_err(|_| ParseError::new(ParseErrorKind::NumericDelta))?;
-    let noreply = parse_noreply(tokens)?;
+    let noreply = parse_noreply(tokenizer)?;
 
     Ok(CommandHeader::Immediate(Command::Arithmetic {
         op,
@@ -243,22 +276,22 @@ fn parse_arithmetic<'a>(
     }))
 }
 
-fn parse_flush_all<'a>(
-    tokens: impl Iterator<Item = &'a [u8]>,
-) -> Result<CommandHeader, ParseError> {
-    let mut tokens = tokens.peekable();
-
-    let delay = match tokens.peek() {
-        Some(&d) if d != b"noreply" => {
+fn parse_flush_all(tokenizer: &mut Tokenizer) -> Result<CommandHeader, ParseError> {
+    let (delay, noreply) = match tokenizer.next() {
+        None => (None, false),
+        Some(b"noreply") => {
+            if tokenizer.next().is_some() {
+                return Err(ParseError::new(ParseErrorKind::BadFormat));
+            }
+            (None, true)
+        }
+        Some(d) => {
             let delay =
                 parse_field::<u32>(d).map_err(|_| ParseError::new(ParseErrorKind::NumericDelay))?;
-            tokens.next(); // consume the delay token now that it parsed successfully
-            Some(delay)
+            let noreply = parse_noreply(tokenizer)?;
+            (Some(delay), noreply)
         }
-        _ => None,
     };
-
-    let noreply = parse_noreply(tokens)?;
 
     Ok(CommandHeader::Immediate(Command::FlushAll {
         delay,
