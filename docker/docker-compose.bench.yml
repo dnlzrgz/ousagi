@@ -5,8 +5,6 @@ services:
       dockerfile: docker/Dockerfile
     container_name: ousagi-bench
     command: ["/bin/server", "-p", "11211", "-t", "${OUSAGI_THREADS:-4}"]
-    ports:
-      - "11211:11211"
     environment:
       - RUST_LOG=info
     read_only: true
@@ -20,6 +18,26 @@ services:
       resources:
         limits:
           cpus: "4"
+          memory: "1024M"
+    networks:
+      - bench
+
+  memcached:
+    image: memcached:1.6.45-alpine3.24
+    container_name: ousagi-memcached
+    command: ["-p", "11211", "-t", "${MEMCACHED_THREADS:-4}", "-m", "1024"]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: "1024M"
     networks:
       - bench
 
