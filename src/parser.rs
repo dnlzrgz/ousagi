@@ -6,6 +6,7 @@ use crate::commands::{ArithmeticOp, Command, Response, StoreArgs, StoreOp};
 const MAX_KEY_LEN: usize = 250;
 const MAX_ITEM_SIZE: usize = 1024 * 1024; // 1 MiB
 
+#[derive(Debug)]
 pub enum ParseErrorKind {
     BadFormat,
     NumericDelta,
@@ -14,6 +15,7 @@ pub enum ParseErrorKind {
     Unknown,
 }
 
+#[derive(Debug)]
 pub struct ParseError {
     kind: ParseErrorKind,
     discard: Option<usize>,
@@ -47,6 +49,7 @@ impl ParseError {
     }
 }
 
+#[derive(Debug)]
 pub struct PendingStore {
     pub op: StoreOp,
     pub key: Bytes,
@@ -73,11 +76,13 @@ impl PendingStore {
     }
 }
 
+#[derive(Debug)]
 pub enum CommandHeader {
     Immediate(Command),
     Store(PendingStore),
 }
 
+#[derive(Debug)]
 pub struct Tokenizer<'a> {
     line: &'a Bytes,
     rest: &'a [u8],
@@ -147,12 +152,13 @@ pub fn parse_command_line(line: &Bytes) -> Result<CommandHeader, ParseError> {
     }
 }
 
+#[inline]
 fn validate_key(key: &[u8]) -> Result<(), ()> {
     if key.is_empty() || key.len() > MAX_KEY_LEN {
         return Err(());
     }
 
-    if key.iter().any(|&b| b <= 0x20 || b == 0x7F) {
+    if key.iter().any(|&b| (b <= 0x20) | (b == 0x7F)) {
         return Err(());
     }
 
@@ -185,7 +191,7 @@ fn parse_get(with_cas: bool, tokenizer: &mut Tokenizer) -> Result<CommandHeader,
         None => return Err(ParseError::new(ParseErrorKind::Unknown)),
     };
 
-    let mut keys = Vec::new();
+    let mut keys = Vec::with_capacity(6);
     keys.push(tokenizer.extract_key(first_key)?);
     while let Some(k) = tokenizer.next() {
         keys.push(tokenizer.extract_key(k)?);
@@ -297,4 +303,83 @@ fn parse_flush_all(tokenizer: &mut Tokenizer) -> Result<CommandHeader, ParseErro
         delay,
         noreply,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(s: &str) -> Bytes {
+        Bytes::copy_from_slice(s.as_bytes())
+    }
+
+    #[test]
+    fn get_single_key_parses_correctly() {
+        let header = parse_command_line(&line("get foo")).expect("should parse correctly");
+
+        match header {
+            CommandHeader::Immediate(Command::Get { keys, with_cas }) => {
+                assert_eq!(keys, vec![Bytes::from_static(b"foo")]);
+                assert!(!with_cas);
+            }
+            _ => panic!("expected Get command without cas"),
+        }
+    }
+
+    #[test]
+    fn get_multiple_keys_parses_correctly() {
+        let header = parse_command_line(&line("get foo bar baz")).expect("should parse correctly");
+
+        match header {
+            CommandHeader::Immediate(Command::Get { keys, with_cas }) => {
+                assert_eq!(
+                    keys,
+                    vec![
+                        Bytes::from_static(b"foo"),
+                        Bytes::from_static(b"bar"),
+                        Bytes::from_static(b"baz")
+                    ]
+                );
+                assert!(!with_cas);
+            }
+            _ => panic!("expected Get command without cas"),
+        }
+    }
+
+    #[test]
+    fn get_with_no_keys_fails() {
+        let err = parse_command_line(&line("get")).unwrap_err();
+        assert!(matches!(err.kind, ParseErrorKind::Unknown));
+    }
+
+    #[test]
+    fn set_returns_pendig_store_with_fields_parsed_correctly() {
+        let header = parse_command_line(&line("set foo 42 0 5")).expect("should parse correctly");
+
+        match header {
+            CommandHeader::Store(pending) => {
+                assert!(matches!(pending.op, StoreOp::Set));
+                assert_eq!(pending.key, Bytes::from_static(b"foo"));
+                assert_eq!(pending.flags, 42);
+                assert_eq!(pending.len, 5);
+                assert!(!pending.noreply)
+            }
+            CommandHeader::Immediate(_) => panic!("expected a pending store"),
+        }
+    }
+
+    #[test]
+    fn set_item_larger_than_max_item_size_fails() {
+        let command = format!("set foo 0 0 {}", MAX_ITEM_SIZE + 1);
+        let err = parse_command_line(&line(&command)).unwrap_err();
+
+        assert!(matches!(err.kind, ParseErrorKind::TooLarge));
+        assert_eq!(err.discard(), Some(MAX_ITEM_SIZE + 1 + 2));
+    }
+
+    #[test]
+    fn unknown_command_fails() {
+        let err = parse_command_line(&line("foo get")).unwrap_err();
+        assert!(matches!(err.kind, ParseErrorKind::Unknown));
+    }
 }

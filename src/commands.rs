@@ -10,6 +10,7 @@ pub enum StoreOp {
     Cas,
 }
 
+#[derive(Debug)]
 pub struct StoreArgs {
     pub key: Bytes,
     pub flags: u32,
@@ -25,6 +26,7 @@ pub enum ArithmeticOp {
     Decr,
 }
 
+#[derive(Debug)]
 pub enum Command {
     Get {
         keys: Vec<Bytes>,
