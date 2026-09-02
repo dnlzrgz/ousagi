@@ -181,30 +181,29 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
             }
             Response::Values(values) => {
                 let mut itoa_buf = itoa::Buffer::new();
+                let mut header_buf = BytesMut::with_capacity(256);
 
                 for (key, flags, data, cas) in values {
-                    self.writer.write_all(b"VALUE ").await?;
-                    self.writer.write_all(key).await?;
-                    self.writer.write_all(b" ").await?;
-                    self.writer
-                        .write_all(itoa_buf.format(*flags).as_bytes())
-                        .await?;
-                    self.writer.write_all(b" ").await?;
-                    self.writer
-                        .write_all(itoa_buf.format(data.len()).as_bytes())
-                        .await?;
+                    header_buf.extend_from_slice(b"VALUE ");
+                    header_buf.extend_from_slice(key);
+                    header_buf.extend_from_slice(b" ");
+                    header_buf.extend_from_slice(itoa_buf.format(*flags).as_bytes());
+                    header_buf.extend_from_slice(b" ");
+                    header_buf.extend_from_slice(itoa_buf.format(data.len()).as_bytes());
 
                     if let Some(c) = cas {
-                        self.writer.write_all(b" ").await?;
-                        self.writer
-                            .write_all(itoa_buf.format(*c).as_bytes())
-                            .await?;
+                        header_buf.extend_from_slice(b" ");
+                        header_buf.extend_from_slice(itoa_buf.format(*c).as_bytes());
                     }
+                    header_buf.extend_from_slice(b"\r\n");
 
-                    self.writer.write_all(b"\r\n").await?;
+                    self.writer.write_all(&header_buf).await?;
                     self.writer.write_all(data).await?;
                     self.writer.write_all(b"\r\n").await?;
+
+                    header_buf.clear();
                 }
+
                 self.writer.write_all(b"END\r\n").await?;
             }
         }

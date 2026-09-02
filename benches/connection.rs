@@ -44,8 +44,6 @@ fn bench_read_line(c: &mut Criterion) {
         );
     });
 
-    // Amortized cost per line when N requests already sit in the socket
-    // buffer at once — the pipelined case `read_line`'s buffer reuse targets.
     for &n in &[10usize, 100, 1_000] {
         let text: String = std::iter::repeat("get foo\r\n").take(n).collect();
         let request = leak(text.into_bytes());
@@ -138,7 +136,10 @@ fn bench_write_response(c: &mut Criterion) {
     group.bench_function("stored", |b| {
         b.to_async(&rt).iter_batched(
             || setup(b""),
-            |mut conn| async move { black_box(conn.write_response(&Response::Stored).await.unwrap()) },
+            |mut conn| async move {
+                conn.write_response(&Response::Stored).await.unwrap();
+                black_box(conn.write_response(&Response::Stored).await.unwrap());
+            },
             BatchSize::SmallInput,
         );
     });

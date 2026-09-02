@@ -1,6 +1,6 @@
 [package]
 name = "ousagi"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 
 [dependencies]
@@ -21,7 +21,7 @@ criterion = {version="0.8.2", features=["html_reports", "async_tokio"]}
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-# panic = "abort"
+panic = "abort"
 strip = true
 
 [profile.bench]

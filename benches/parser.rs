@@ -44,28 +44,34 @@ fn bench_store(c: &mut Criterion) {
     group.bench_function("set", |b| b.iter(|| parse_command_line(black_box(&set))));
 
     let add = line("add foo 0 0 512");
+    group.throughput(Throughput::Bytes(add.len() as u64));
     group.bench_function("add", |b| b.iter(|| parse_command_line(black_box(&add))));
 
     let append = line("append foo 0 0 512");
+    group.throughput(Throughput::Bytes(append.len() as u64));
     group.bench_function("append", |b| {
         b.iter(|| parse_command_line(black_box(&append)))
     });
 
     let prepend = line("prepend foo 0 0 512");
+    group.throughput(Throughput::Bytes(prepend.len() as u64));
     group.bench_function("prepend", |b| {
         b.iter(|| parse_command_line(black_box(&prepend)))
     });
 
     let cas = line("cas foo 0 0 512 123456789");
+    group.throughput(Throughput::Bytes(cas.len() as u64));
     group.bench_function("cas", |b| b.iter(|| parse_command_line(black_box(&cas))));
 
     let noreply = line("set foo 0 0 512 noreply");
+    group.throughput(Throughput::Bytes(noreply.len() as u64));
     group.bench_function("set_noreply", |b| {
         b.iter(|| parse_command_line(black_box(&noreply)))
     });
 
     let long_key_text = format!("set {} 0 0 512", "k".repeat(250));
     let long_key = line(&long_key_text);
+    group.throughput(Throughput::Bytes(long_key.len() as u64));
     group.bench_function("set_max_key_len", |b| {
         b.iter(|| parse_command_line(black_box(&long_key)))
     });
