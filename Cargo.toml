@@ -12,9 +12,10 @@ bytes = "1.12.1"
 itoa = "1.0.18"
 dashmap = "6.2.1"
 atoi = "3.1.0"
+memchr = "2.8.3"
 
 [dev-dependencies]
-criterion = {version="0.8.2", features=["html_reports"]}
+criterion = {version="0.8.2", features=["html_reports", "async_tokio"]}
 
 [profile.release]
 opt-level = 3
@@ -30,4 +31,8 @@ strip = false
 
 [[bench]]
 name = "parser"
+harness = false
+
+[[bench]]
+name = "connection"
 harness = false

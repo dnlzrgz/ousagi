@@ -226,6 +226,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tinytemplate",
+ "tokio",
  "walkdir",
 ]
 
@@ -484,6 +485,7 @@ dependencies = [
  "criterion",
  "dashmap",
  "itoa",
+ "memchr",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -1,11 +1,9 @@
 use std::{io, time::SystemTime};
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use dashmap::Entry;
 use tokio::{
-    io::{
-        AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
-    },
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
     net::TcpStream,
 };
 
@@ -17,7 +15,8 @@ use crate::{
 
 const MAX_LINE_LEN: u64 = 8 * 1024; // bytes
 
-enum ReadLineError {
+#[derive(Debug)]
+pub enum ReadLineError {
     Io(io::Error),
     TooLong,
 }
@@ -28,7 +27,8 @@ impl From<io::Error> for ReadLineError {
     }
 }
 
-enum PayloadError {
+#[derive(Debug)]
+pub enum PayloadError {
     Io(io::Error),
     BadChunk,
 }
@@ -39,56 +39,53 @@ impl From<io::Error> for PayloadError {
     }
 }
 
-pub(crate) struct Connection<R, W> {
-    reader: BufReader<R>,
+pub struct Connection<R, W> {
+    reader: R,
     writer: BufWriter<W>,
-    line: Vec<u8>,
+    buffer: BytesMut,
 }
 
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
-    fn new(reader: R, writer: W) -> Self {
+    pub fn new(reader: R, writer: W) -> Self {
         Connection {
-            reader: BufReader::new(reader),
+            reader: reader,
             writer: BufWriter::new(writer),
-            line: Vec::with_capacity(128),
+            buffer: BytesMut::new(),
         }
     }
 
-    async fn read_line(&mut self) -> Result<Option<Bytes>, ReadLineError> {
-        self.line.clear();
+    pub async fn read_line(&mut self) -> Result<Option<Bytes>, ReadLineError> {
+        loop {
+            if let Some(pos) = memchr::memchr(b'\n', &self.buffer) {
+                let mut line = Bytes::copy_from_slice(&self.buffer[..=pos]);
+                self.buffer.advance(pos + 1);
 
-        if self.reader.buffer().is_empty() {
-            self.writer.flush().await?;
-        }
+                while matches!(line.last(), Some(b'\n') | Some(b'\r')) {
+                    line.truncate(line.len() - 1);
+                }
 
-        let n = {
-            let mut limited = (&mut self.reader).take(MAX_LINE_LEN);
-            limited.read_until(b'\n', &mut self.line).await?
-        };
+                return Ok(Some(line));
+            }
 
-        if n == 0 {
-            return Ok(None); // EOF
-        }
-
-        if self.line.last() != Some(&b'\n') {
-            if n as u64 == MAX_LINE_LEN {
+            if self.buffer.len() as u64 >= MAX_LINE_LEN {
                 return Err(ReadLineError::TooLong);
-            } else {
-                return Ok(None); // EOF without newline
+            }
+
+            if self.fill_buffer().await? == 0 {
+                return Ok(None);
             }
         }
-
-        while matches!(self.line.last(), Some(b'\n') | Some(b'\r')) {
-            self.line.pop();
-        }
-
-        let line = std::mem::replace(&mut self.line, Vec::with_capacity(128));
-        Ok(Some(Bytes::from(line)))
     }
 
-    async fn read_payload(&mut self, len: usize) -> Result<Bytes, PayloadError> {
+    pub async fn read_payload(&mut self, len: usize) -> Result<Bytes, PayloadError> {
         let mut data = BytesMut::with_capacity(len);
+
+        let from_buffer = self.buffer.len().min(len);
+        data.extend_from_slice(&self.buffer[..from_buffer]);
+        self.buffer.advance(from_buffer);
+
         while data.len() < len {
+            self.writer.flush().await?;
             if self.reader.read_buf(&mut data).await? == 0 {
                 return Err(PayloadError::Io(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -97,16 +94,25 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
             }
         }
 
-        let mut crlf = [0u8; 2];
-        self.reader.read_exact(&mut crlf).await?;
-        if crlf != *b"\r\n" {
+        while self.buffer.len() < 2 {
+            if self.fill_buffer().await? == 0 {
+                return Err(PayloadError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed mid-payload",
+                )));
+            }
+        }
+        let crlf_ok = &self.buffer[..2] == b"\r\n";
+        self.buffer.advance(2);
+
+        if !crlf_ok {
             return Err(PayloadError::BadChunk);
         }
 
         Ok(data.freeze())
     }
 
-    async fn read_command(&mut self) -> io::Result<Option<Command>> {
+    pub async fn read_command(&mut self) -> io::Result<Option<Command>> {
         loop {
             let line = match self.read_line().await {
                 Ok(Some(line)) => line,
@@ -149,7 +155,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
         }
     }
 
-    async fn write_response(&mut self, resp: &Response) -> io::Result<()> {
+    pub async fn write_response(&mut self, resp: &Response) -> io::Result<()> {
         match resp {
             Response::Stored => self.writer.write_all(b"STORED\r\n").await?,
             Response::NotStored => self.writer.write_all(b"NOT_STORED\r\n").await?,
@@ -206,23 +212,38 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
         Ok(())
     }
 
-    async fn discard_exact(&mut self, n: usize) -> io::Result<()> {
-        let mut limited = (&mut self.reader).take(n as u64);
-        tokio::io::copy(&mut limited, &mut tokio::io::sink()).await?;
+    async fn discard_exact(&mut self, mut n: usize) -> io::Result<()> {
+        let from_buffer = self.buffer.len().min(n);
+        self.buffer.advance(from_buffer);
+        n -= from_buffer;
+
+        if n > 0 {
+            self.writer.flush().await?;
+            let mut limited = (&mut self.reader).take(n as u64);
+            tokio::io::copy(&mut limited, &mut tokio::io::sink()).await?;
+        }
+
         Ok(())
     }
 
     async fn discard_until_newline(&mut self) -> io::Result<()> {
-        let mut junk = Vec::new();
         loop {
-            junk.clear();
-
-            let mut limited = (&mut self.reader).take(MAX_LINE_LEN);
-            let n = limited.read_until(b'\n', &mut junk).await?;
-            if n == 0 || junk.last() == Some(&b'\n') {
+            if let Some(pos) = memchr::memchr(b'\n', &self.buffer) {
+                self.buffer.advance(pos + 1);
                 return Ok(());
             }
+
+            self.buffer.clear();
+            if self.reader.read_buf(&mut self.buffer).await? == 0 {
+                return Ok(()); // EOF
+            }
         }
+    }
+
+    async fn fill_buffer(&mut self) -> io::Result<usize> {
+        self.writer.flush().await?;
+        self.buffer.reserve(4096);
+        self.reader.read_buf(&mut self.buffer).await
     }
 }
 
@@ -433,7 +454,6 @@ mod tests {
     use super::*;
     use crate::commands::StoreArgs;
     use crate::store::StoreInner;
-    use bytes::Bytes;
     use std::sync::Arc;
     use tokio::io::{DuplexStream, ReadHalf, WriteHalf, duplex, split};
 
