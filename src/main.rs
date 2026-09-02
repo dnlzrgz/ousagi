@@ -128,6 +128,10 @@ async fn accept_loop(listener: TcpListener, store: Store, connections: Arc<Semap
             }
         };
 
+        if let Err(e) = socket.set_nodelay(true) {
+            tracing::warn!(%addr, error = %e, "failed to set TCP_NODELAY");
+        }
+
         tracing::info!(%addr, "connection accepted");
         let store = store.clone();
         tokio::spawn(async move {
