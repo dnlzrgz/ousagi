@@ -4,10 +4,12 @@ use bytes::Bytes;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use ousagi::commands::Response;
 use ousagi::connection::Connection;
+use ousagi::runtime;
 use tokio::runtime::Runtime;
 
+#[inline]
 fn rt() -> Runtime {
-    Runtime::new().unwrap()
+    runtime::build(1)
 }
 
 /// Leaks `bytes` to get a `'static` slice. Runs some times at setup, not per-iteration.

@@ -1,4 +1,4 @@
-use std::{io, time::SystemTime};
+use std::io;
 
 use bytes::{Buf, Bytes, BytesMut};
 use dashmap::Entry;
@@ -247,7 +247,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
 }
 
 pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
-    let now = SystemTime::now();
+    let now = store.now();
 
     match cmd {
         Command::Get { keys, with_cas } => {
@@ -294,22 +294,22 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
                         Response::NotStored
                     }
                     Entry::Occupied(mut entry) => {
-                        entry.insert(Item::new(args.data, args.flags, args.exptime, cas));
+                        entry.insert(Item::new(args.data, args.flags, args.exptime, cas, now));
                         Response::Stored
                     }
                     Entry::Vacant(entry) => {
-                        entry.insert(Item::new(args.data, args.flags, args.exptime, cas));
+                        entry.insert(Item::new(args.data, args.flags, args.exptime, cas, now));
                         Response::Stored
                     }
                 },
                 StoreOp::Set => {
-                    let item = Item::new(args.data, args.flags, args.exptime, cas);
+                    let item = Item::new(args.data, args.flags, args.exptime, cas, now);
                     store.items.insert(args.key, item);
                     Response::Stored
                 }
                 StoreOp::Replace => match store.items.entry(args.key) {
                     Entry::Occupied(mut entry) if !entry.get().is_expired(now, oldest_live) => {
-                        entry.insert(Item::new(args.data, args.flags, args.exptime, cas));
+                        entry.insert(Item::new(args.data, args.flags, args.exptime, cas, now));
                         Response::Stored
                     }
                     _ => Response::NotStored,
@@ -354,7 +354,7 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
                             return Response::Exists;
                         }
 
-                        entry.insert(Item::new(args.data, args.flags, args.exptime, cas));
+                        entry.insert(Item::new(args.data, args.flags, args.exptime, cas, now));
                         Response::Stored
                     }
                     _ => Response::NotFound,
@@ -451,23 +451,31 @@ pub async fn process(socket: TcpStream, store: Store) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::StoreArgs;
     use crate::store::StoreInner;
+    use crate::{clock::Clock, commands::StoreArgs};
     use std::sync::Arc;
     use tokio::io::{DuplexStream, ReadHalf, WriteHalf, duplex, split};
 
+    const TEST_NOW: u64 = 1_000_000;
+
     /// Fresh, empty Store.
     fn empty_store() -> Store {
-        Arc::new(StoreInner::new())
+        let shared_clock = Clock::mock(TEST_NOW);
+        Arc::new(StoreInner::new(shared_clock))
     }
 
     /// Store pre-populated with one item under `key`.
     fn store_with(key: &str, item: Item) -> Store {
-        let inner = StoreInner::new();
+        let shared_clock = Clock::mock(TEST_NOW);
+        let inner = StoreInner::new(shared_clock);
         inner
             .items
             .insert(Bytes::copy_from_slice(key.as_bytes()), item);
         Arc::new(inner)
+    }
+
+    fn mock_item(data: Bytes, flags: u32, exptime: i64, cas: u64) -> Item {
+        Item::new(data, flags, exptime, cas, TEST_NOW)
     }
 
     /// Builds a mock connection wired to an in-memory duplex pipeline instead of
@@ -533,7 +541,7 @@ mod tests {
 
     #[test]
     fn get_multiple_keys_skips_missing_one() {
-        let store = store_with("foo", Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1));
+        let store = store_with("foo", mock_item(Bytes::copy_from_slice(b"hello"), 42, 0, 1));
         let cmd = Command::Get {
             keys: vec!["foo".into(), "bar".into()],
             with_cas: false,
@@ -549,7 +557,7 @@ mod tests {
     fn get_expired_key_is_treated_as_missing_and_lazily_removed() {
         let store = store_with(
             "foo",
-            Item::new(Bytes::copy_from_slice(b"hello"), 42, -1, 1),
+            mock_item(Bytes::copy_from_slice(b"hello"), 42, -1, 1),
         );
 
         let resp = execute(
@@ -589,7 +597,7 @@ mod tests {
 
     #[test]
     fn add_existing_key_fails_and_returns_not_stored() {
-        let item = Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1);
+        let item = mock_item(Bytes::copy_from_slice(b"hello"), 42, 0, 1);
         let cmd = Command::Store(
             StoreOp::Add,
             StoreArgs {
@@ -616,7 +624,7 @@ mod tests {
 
     #[test]
     fn add_existing_expired_key_overwrites_and_returns_stored() {
-        let item = Item::new(Bytes::copy_from_slice(b"hello"), 42, -1, 1);
+        let item = mock_item(Bytes::copy_from_slice(b"hello"), 42, -1, 1);
         let cmd = Command::Store(
             StoreOp::Add,
             StoreArgs {
@@ -636,7 +644,7 @@ mod tests {
 
     #[test]
     fn replace_existing_key_stores_new_value() {
-        let store = store_with("foo", Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1));
+        let store = store_with("foo", mock_item(Bytes::copy_from_slice(b"hello"), 42, 0, 1));
 
         let cmd = Command::Store(
             StoreOp::Replace,
@@ -662,7 +670,10 @@ mod tests {
 
     #[test]
     fn replace_missing_key_returns_not_stored() {
-        let store = store_with("foo", Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1));
+        let store = store_with(
+            "foo",
+            mock_item(Bytes::copy_from_slice(b"hello"), 42, -1, 1),
+        );
 
         let cmd = Command::Store(
             StoreOp::Replace,
@@ -684,7 +695,7 @@ mod tests {
     fn replace_expired_key_returns_not_stored() {
         let store = store_with(
             "foo",
-            Item::new(Bytes::copy_from_slice(b"hello"), 42, -1, 1),
+            mock_item(Bytes::copy_from_slice(b"hello"), 42, -1, 1),
         );
 
         let cmd = Command::Store(
@@ -728,7 +739,10 @@ mod tests {
 
     #[test]
     fn set_overwrites_existing_key() {
-        let store = store_with("foo", Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1));
+        let store = store_with(
+            "foo",
+            mock_item(Bytes::copy_from_slice(b"hello"), 42, -1, 1),
+        );
         let cmd = Command::Store(
             StoreOp::Set,
             StoreArgs {
@@ -751,7 +765,7 @@ mod tests {
 
     #[test]
     fn delete_existing_key_returns_deleted_and_removes_it() {
-        let store = store_with("foo", Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1));
+        let store = store_with("foo", mock_item(Bytes::copy_from_slice(b"hello"), 42, 0, 1));
         let cmd = Command::Delete {
             key: "foo".into(),
             noreply: true,
@@ -765,7 +779,7 @@ mod tests {
 
     #[test]
     fn delete_missing_key_returns_not_found() {
-        let store = store_with("foo", Item::new(Bytes::copy_from_slice(b"hello"), 42, 0, 1));
+        let store = store_with("foo", mock_item(Bytes::copy_from_slice(b"hello"), 42, 0, 1));
         let cmd = Command::Delete {
             key: "bar".into(),
             noreply: true,
@@ -779,7 +793,7 @@ mod tests {
 
     #[test]
     fn incr_existing_key_increments_value_and_returns_it() {
-        let store = store_with("foo", Item::new(Bytes::from_static(b"10"), 42, 0, 1));
+        let store = store_with("foo", mock_item(Bytes::from_static(b"10"), 42, 0, 1));
         let cmd = Command::Arithmetic {
             op: ArithmeticOp::Incr,
             key: "foo".into(),
@@ -799,7 +813,7 @@ mod tests {
 
     #[test]
     fn incr_missing_key_returns_not_found() {
-        let store = store_with("foo", Item::new(Bytes::from_static(b"10"), 42, 0, 1));
+        let store = store_with("foo", mock_item(Bytes::from_static(b"10"), 42, 0, 1));
         let cmd = Command::Arithmetic {
             op: ArithmeticOp::Incr,
             key: "bar".into(),
@@ -815,7 +829,7 @@ mod tests {
     fn incr_overflow_wraps_around() {
         let store = store_with(
             "foo",
-            Item::new(Bytes::from(u64::MAX.to_string()), 42, 0, 1),
+            mock_item(Bytes::from(u64::MAX.to_string()), 42, 0, 1),
         );
         let cmd = Command::Arithmetic {
             op: ArithmeticOp::Incr,
@@ -836,7 +850,7 @@ mod tests {
 
     #[test]
     fn decr_existing_key_decrements_value_and_returns_it() {
-        let store = store_with("foo", Item::new(Bytes::from_static(b"10"), 42, 0, 1));
+        let store = store_with("foo", mock_item(Bytes::from_static(b"10"), 42, 0, 1));
         let cmd = Command::Arithmetic {
             op: ArithmeticOp::Decr,
             key: "foo".into(),
@@ -856,7 +870,7 @@ mod tests {
 
     #[test]
     fn decr_missing_key_returns_not_found() {
-        let store = store_with("foo", Item::new(Bytes::from_static(b"10"), 42, 0, 1));
+        let store = store_with("foo", mock_item(Bytes::from_static(b"10"), 42, 0, 1));
         let cmd = Command::Arithmetic {
             op: ArithmeticOp::Decr,
             key: "bar".into(),
@@ -870,7 +884,7 @@ mod tests {
 
     #[test]
     fn decr_underflow_saturates_at_zero() {
-        let store = store_with("foo", Item::new(Bytes::from_static(b"0"), 42, 0, 1));
+        let store = store_with("foo", mock_item(Bytes::from_static(b"0"), 42, 0, 1));
         let cmd = Command::Arithmetic {
             op: ArithmeticOp::Decr,
             key: "foo".into(),
@@ -890,7 +904,7 @@ mod tests {
 
     #[test]
     fn flush_all_immediate_clears_all_items_and_returns_ok() {
-        let store = store_with("foo", Item::new(Bytes::from_static(b"0"), 42, 0, 1));
+        let store = store_with("foo", mock_item(Bytes::from_static(b"0"), 42, 0, 1));
         let cmd = Command::FlushAll {
             delay: None,
             noreply: false,
@@ -904,7 +918,7 @@ mod tests {
 
     #[test]
     fn flush_all_with_delay_does_not_immediately_remove_items() {
-        let store = store_with("foo", Item::new(Bytes::from_static(b"0"), 42, 0, 1));
+        let store = store_with("foo", mock_item(Bytes::from_static(b"0"), 42, 0, 1));
         let cmd = Command::FlushAll {
             delay: Some(3600),
             noreply: false,

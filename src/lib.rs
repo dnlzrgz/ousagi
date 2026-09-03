@@ -1,3 +1,4 @@
+pub mod clock;
 pub mod commands;
 pub mod connection;
 pub mod parser;

@@ -2,6 +2,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use clap::{ArgAction, Parser};
 use ousagi::{
+    clock::spawn_clock,
     connection,
     store::{Store, StoreInner},
 };
@@ -100,7 +101,8 @@ async fn run(args: Args) {
     let listener = TcpListener::bind(addr).await.unwrap();
     tracing::info!(addr = %addr, threads = args.threads, "listening");
 
-    let store: Store = Arc::new(StoreInner::new());
+    let shared_clock = spawn_clock();
+    let store: Store = Arc::new(StoreInner::new(shared_clock));
     let connections = Arc::new(Semaphore::new(args.max_connections));
 
     tokio::select! {
