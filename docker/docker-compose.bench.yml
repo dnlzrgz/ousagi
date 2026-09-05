@@ -3,8 +3,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    container_name: ousagi-bench
-    command: ["/bin/server", "-p", "11211", "-t", "${OUSAGI_THREADS:-4}"]
+    command: ["/bin/server", "-p", "11211", "-t", "${THREADS:-4}"]
     environment:
       - RUST_LOG=info
     read_only: true
@@ -24,8 +23,7 @@ services:
 
   memcached:
     image: memcached:1.6.45-alpine3.24
-    container_name: ousagi-memcached
-    command: ["-p", "11211", "-t", "${MEMCACHED_THREADS:-4}", "-m", "1024"]
+    command: ["-p", "11211", "-t", "${THREADS:-4}", "-m", "1024"]
     read_only: true
     cap_drop:
       - ALL
@@ -43,18 +41,8 @@ services:
 
   memtier:
     image: redislabs/memtier_benchmark:2.5.1
-    container_name: ousagi-memtier
     networks:
       - bench
-    command: >
-      --server=ousagi --port=11211
-      --protocol=memcache_text
-      --clients=50 --threads=4
-      --data-size=128 --ratio=1:10
-      --key-pattern=R:R
-      --key-minimum=1 --key-maximum=100000
-      --test-time=30
-      --print-percentiles=50,90,99,99.9
 
 networks:
   bench:
