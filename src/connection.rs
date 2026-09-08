@@ -10,6 +10,7 @@ use tokio::{
 use crate::{
     commands::{ArithmeticOp, Command, Response, StoreOp},
     parser::{CommandHeader, parse_command_line},
+    stats::Stats,
     store::{Item, Store},
 };
 
@@ -57,8 +58,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
     pub async fn read_line(&mut self) -> Result<Option<Bytes>, ReadLineError> {
         loop {
             if let Some(pos) = memchr::memchr(b'\n', &self.buffer) {
-                let mut line = Bytes::copy_from_slice(&self.buffer[..=pos]);
-                self.buffer.advance(pos + 1);
+                let mut line = self.buffer.split_to(pos + 1).freeze();
 
                 while matches!(line.last(), Some(b'\n') | Some(b'\r')) {
                     line.truncate(line.len() - 1);
@@ -206,6 +206,16 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
 
                 self.writer.write_all(b"END\r\n").await?;
             }
+            Response::Stats(entries) => {
+                for (name, value) in entries {
+                    self.writer.write_all(b"STAT ").await?;
+                    self.writer.write_all(name.as_bytes()).await?;
+                    self.writer.write_all(b" ").await?;
+                    self.writer.write_all(value.as_bytes()).await?;
+                    self.writer.write_all(b"\r\n").await?;
+                }
+                self.writer.write_all(b"END\r\n").await?;
+            }
         }
 
         Ok(())
@@ -253,19 +263,28 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
         Command::Get { keys, with_cas } => {
             tracing::debug!(?keys, with_cas, "get");
 
+            Stats::incr(&store.stats.cmd_get, keys.len() as u64);
+
             let oldest_live = store.oldest_live();
-            let mut expired_keys = Vec::new();
-            let mut values = Vec::new();
+            let mut expired_keys = Vec::with_capacity(6);
+            let mut values = Vec::with_capacity(6);
 
             {
                 for key in keys {
                     match store.items.get(&key) {
-                        Some(item) if item.is_expired(now, oldest_live) => expired_keys.push(key),
+                        Some(item) if item.is_expired(now, oldest_live) => {
+                            Stats::incr(&store.stats.get_expired, 1);
+                            Stats::incr(&store.stats.get_misses, 1);
+                            expired_keys.push(key);
+                        }
                         Some(item) => {
+                            Stats::incr(&store.stats.get_hits, 1);
                             let cas = with_cas.then(|| item.cas());
                             values.push((key, item.flags(), item.data().clone(), cas));
                         }
-                        None => {}
+                        None => {
+                            Stats::incr(&store.stats.get_misses, 1);
+                        }
                     }
                 }
             }
@@ -285,6 +304,8 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
         Command::Store(op, args) => {
             tracing::debug!(?op, key = ?args.key, len = args.data.len(), exptime = args.exptime, "store");
 
+            Stats::incr(&store.stats.cmd_set, 1);
+
             let oldest_live = store.oldest_live();
             let cas = store.next_cas();
 
@@ -295,21 +316,25 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
                     }
                     Entry::Occupied(mut entry) => {
                         entry.insert(Item::new(args.data, args.flags, args.exptime, cas, now));
+                        Stats::incr(&store.stats.total_items, 1);
                         Response::Stored
                     }
                     Entry::Vacant(entry) => {
                         entry.insert(Item::new(args.data, args.flags, args.exptime, cas, now));
+                        Stats::incr(&store.stats.total_items, 1);
                         Response::Stored
                     }
                 },
                 StoreOp::Set => {
                     let item = Item::new(args.data, args.flags, args.exptime, cas, now);
                     store.items.insert(args.key, item);
+                    Stats::incr(&store.stats.total_items, 1);
                     Response::Stored
                 }
                 StoreOp::Replace => match store.items.entry(args.key) {
                     Entry::Occupied(mut entry) if !entry.get().is_expired(now, oldest_live) => {
                         entry.insert(Item::new(args.data, args.flags, args.exptime, cas, now));
+                        Stats::incr(&store.stats.total_items, 1);
                         Response::Stored
                     }
                     _ => Response::NotStored,
@@ -338,6 +363,7 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
                             old_item.stored_at(),
                         );
                         entry.insert(item);
+                        Stats::incr(&store.stats.total_items, 1);
                         Response::Stored
                     }
                     _ => Response::NotStored,
@@ -351,13 +377,19 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
                                 "cas mismatch"
                             );
 
+                            Stats::incr(&store.stats.cas_badval, 1);
                             return Response::Exists;
                         }
 
                         entry.insert(Item::new(args.data, args.flags, args.exptime, cas, now));
+                        Stats::incr(&store.stats.cas_hits, 1);
+                        Stats::incr(&store.stats.total_items, 1);
                         Response::Stored
                     }
-                    _ => Response::NotFound,
+                    _ => {
+                        Stats::incr(&store.stats.cas_misses, 1);
+                        Response::NotFound
+                    }
                 },
             }
         }
@@ -365,8 +397,14 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
             tracing::debug!(?key, "delete");
 
             match store.items.remove(&key) {
-                Some(_) => Response::Deleted,
-                None => Response::NotFound,
+                Some(_) => {
+                    Stats::incr(&store.stats.delete_hits, 1);
+                    Response::Deleted
+                }
+                None => {
+                    Stats::incr(&store.stats.delete_misses, 1);
+                    Response::NotFound
+                }
             }
         }
         Command::Arithmetic {
@@ -376,6 +414,11 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
             noreply: _,
         } => {
             tracing::debug!(?op, ?key, delta, "incr/decr");
+
+            let (hits, misses) = match op {
+                ArithmeticOp::Incr => (&store.stats.incr_hits, &store.stats.incr_misses),
+                ArithmeticOp::Decr => (&store.stats.decr_hits, &store.stats.decr_misses),
+            };
 
             let oldest_live = store.oldest_live();
             let cas = store.next_cas();
@@ -411,13 +454,19 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
                     );
 
                     entry.insert(new_item);
+                    Stats::incr(hits, 1);
                     Response::Number(new_val)
                 }
-                _ => Response::NotFound,
+                _ => {
+                    Stats::incr(misses, 1);
+                    Response::NotFound
+                }
             }
         }
         Command::FlushAll { delay, noreply: _ } => {
             tracing::debug!(?delay, "flush_all");
+
+            Stats::incr(&store.stats.cmd_flush, 1);
 
             match delay {
                 Some(0) | None => {
@@ -429,6 +478,10 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
             }
 
             Response::Ok
+        }
+        Command::Stats => {
+            tracing::debug!("stats");
+            Response::Stats(store.stats.report(store.items.len()))
         }
     }
 }
@@ -454,6 +507,7 @@ mod tests {
     use crate::store::StoreInner;
     use crate::{clock::Clock, commands::StoreArgs};
     use std::sync::Arc;
+    use std::sync::atomic::Ordering::Relaxed;
     use tokio::io::{DuplexStream, ReadHalf, WriteHalf, duplex, split};
 
     const TEST_NOW: u64 = 1_000_000;
@@ -932,5 +986,67 @@ mod tests {
             .get("foo".as_bytes())
             .expect("key should still be present");
         assert_eq!(item.data().as_ref(), b"0");
+    }
+
+    #[test]
+    fn get_hit_increments_cmd_get_and_get_hits() {
+        let store = store_with("foo", mock_item(Bytes::copy_from_slice(b"hello"), 42, 0, 1));
+        let cmd = Command::Get {
+            keys: vec!["foo".into()],
+            with_cas: false,
+        };
+
+        execute(cmd, &store);
+
+        assert_eq!(store.stats.cmd_get.load(Relaxed), 1);
+        assert_eq!(store.stats.get_hits.load(Relaxed), 1);
+        assert_eq!(store.stats.get_misses.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn get_miss_increments_get_misses_not_hits() {
+        let store = empty_store();
+        let cmd = Command::Get {
+            keys: vec!["foo".into()],
+            with_cas: false,
+        };
+
+        execute(cmd, &store);
+
+        assert_eq!(store.stats.get_misses.load(Relaxed), 1);
+        assert_eq!(store.stats.get_hits.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn get_expired_key_increments_get_expired_and_get_misses() {
+        let store = store_with(
+            "foo",
+            mock_item(Bytes::copy_from_slice(b"hello"), 42, -1, 1),
+        );
+        let cmd = Command::Get {
+            keys: vec!["foo".into()],
+            with_cas: false,
+        };
+
+        execute(cmd, &store);
+
+        assert_eq!(store.stats.get_expired.load(Relaxed), 1);
+        assert_eq!(store.stats.get_misses.load(Relaxed), 1);
+        assert_eq!(store.stats.get_hits.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn multi_key_get_counts_cmd_get_per_key_not_per_call() {
+        let store = store_with("foo", mock_item(Bytes::copy_from_slice(b"hello"), 42, 0, 1));
+        let cmd = Command::Get {
+            keys: vec!["foo".into(), "bar".into(), "baz".into()],
+            with_cas: false,
+        };
+
+        execute(cmd, &store);
+
+        assert_eq!(store.stats.cmd_get.load(Relaxed), 3);
+        assert_eq!(store.stats.get_hits.load(Relaxed), 1);
+        assert_eq!(store.stats.get_misses.load(Relaxed), 2);
     }
 }

@@ -6,7 +6,7 @@ use std::sync::{
 use bytes::Bytes;
 use dashmap::DashMap;
 
-use crate::clock::SharedClock;
+use crate::{clock::SharedClock, stats::Stats};
 
 const THIRTY_DAYS_SECS: i64 = 60 * 60 * 24 * 30;
 
@@ -89,7 +89,8 @@ impl Item {
 }
 
 pub struct StoreInner {
-    pub items: DashMap<Bytes, Item>,
+    pub items: DashMap<Bytes, Item, ahash::RandomState>,
+    pub stats: Stats,
     next_cas: AtomicU64,
     oldest_live: AtomicU64,
     shared_clock: SharedClock,
@@ -98,7 +99,8 @@ pub struct StoreInner {
 impl StoreInner {
     pub fn new(shared_clock: SharedClock) -> Self {
         Self {
-            items: DashMap::new(),
+            items: DashMap::default(),
+            stats: Stats::new(),
             next_cas: AtomicU64::new(1),
             oldest_live: AtomicU64::new(0),
             shared_clock,

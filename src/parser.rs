@@ -148,6 +148,7 @@ pub fn parse_command_line(line: &Bytes) -> Result<CommandHeader, ParseError> {
         b"incr" => parse_arithmetic(ArithmeticOp::Incr, &mut tokenizer),
         b"decr" => parse_arithmetic(ArithmeticOp::Decr, &mut tokenizer),
         b"flush_all" => parse_flush_all(&mut tokenizer),
+        b"stats" => parse_stats(&mut tokenizer),
         _ => Err(ParseError::new(ParseErrorKind::Unknown)),
     }
 }
@@ -305,6 +306,15 @@ fn parse_flush_all(tokenizer: &mut Tokenizer) -> Result<CommandHeader, ParseErro
     }))
 }
 
+fn parse_stats(tokenizer: &mut Tokenizer) -> Result<CommandHeader, ParseError> {
+    if tokenizer.next().is_some() {
+        // TODO: add support for subcomamnds
+        return Err(ParseError::new(ParseErrorKind::BadFormat));
+    }
+
+    Ok(CommandHeader::Immediate(Command::Stats))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,5 +391,21 @@ mod tests {
     fn unknown_command_fails() {
         let err = parse_command_line(&line("foo get")).unwrap_err();
         assert!(matches!(err.kind, ParseErrorKind::Unknown));
+    }
+
+    #[test]
+    fn stats_parses_to_stats_command() {
+        let header = parse_command_line(&line("stats")).expect("should parse correctly");
+
+        match header {
+            CommandHeader::Immediate(Command::Stats) => {}
+            _ => panic!("expected Stats command"),
+        }
+    }
+
+    #[test]
+    fn stats_with_subcommand_fails() {
+        let err = parse_command_line(&line("stats items")).unwrap_err();
+        assert!(matches!(err.kind, ParseErrorKind::BadFormat));
     }
 }

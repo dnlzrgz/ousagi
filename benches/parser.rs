@@ -126,6 +126,16 @@ fn bench_flush_all(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_stats(c: &mut Criterion) {
+    let mut group = c.benchmark_group("parse_stats");
+
+    let bare = line("stats");
+    group.throughput(Throughput::Bytes(bare.len() as u64));
+    group.bench_function("bare", |b| b.iter(|| parse_command_line(black_box(&bare))));
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_get,
@@ -133,6 +143,7 @@ criterion_group!(
     bench_delete,
     bench_arithmetic,
     bench_flush_all,
+    bench_stats,
 );
 
 criterion_main!(benches);

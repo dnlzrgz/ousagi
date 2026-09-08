@@ -47,6 +47,7 @@ pub enum Command {
         delay: Option<u32>,
         noreply: bool,
     },
+    Stats,
 }
 
 impl Command {
@@ -56,6 +57,7 @@ impl Command {
     pub(crate) fn noreply(&self) -> bool {
         match self {
             Command::Get { .. } => false,
+            Command::Stats { .. } => false,
             Command::Store(_, args) => args.noreply,
             Command::Delete { noreply, .. }
             | Command::Arithmetic { noreply, .. }
@@ -78,4 +80,5 @@ pub enum Response {
     Error,
     ClientError(&'static str),
     ServerError(&'static str),
+    Stats(Vec<(&'static str, String)>),
 }
