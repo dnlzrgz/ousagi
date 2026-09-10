@@ -102,7 +102,7 @@ async fn run(args: Args) {
     tracing::info!(addr = %addr, threads = args.threads, "listening");
 
     let shared_clock = spawn_clock();
-    let store: Store = Arc::new(StoreInner::new(shared_clock));
+    let store: Store = Arc::new(StoreInner::new(shared_clock, args.threads));
     let connections = Arc::new(Semaphore::new(args.max_connections));
 
     tokio::select! {

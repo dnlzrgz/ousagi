@@ -89,7 +89,7 @@ impl Item {
 }
 
 pub struct StoreInner {
-    pub items: DashMap<Bytes, Item, ahash::RandomState>,
+    pub items: DashMap<Bytes, Item>,
     pub stats: Stats,
     next_cas: AtomicU64,
     oldest_live: AtomicU64,
@@ -97,9 +97,14 @@ pub struct StoreInner {
 }
 
 impl StoreInner {
-    pub fn new(shared_clock: SharedClock) -> Self {
+    pub fn new(shared_clock: SharedClock, threads: usize) -> Self {
+        let shard_amount = (threads.max(1) * 4).next_power_of_two();
+
         Self {
-            items: DashMap::default(),
+            items: DashMap::with_hasher_and_shard_amount(
+                std::hash::RandomState::default(),
+                shard_amount,
+            ),
             stats: Stats::new(),
             next_cas: AtomicU64::new(1),
             oldest_live: AtomicU64::new(0),
