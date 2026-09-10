@@ -151,6 +151,10 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                     }
                     Err(PayloadError::Io(e)) => return Err(e),
                 },
+                CommandHeader::Quit => {
+                    tracing::debug!("quit");
+                    return Ok(None);
+                }
             };
 
             return Ok(Some(command));

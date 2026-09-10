@@ -80,6 +80,7 @@ impl PendingStore {
 pub enum CommandHeader {
     Immediate(Command),
     Store(PendingStore),
+    Quit,
 }
 
 #[derive(Debug)]
@@ -152,6 +153,7 @@ pub fn parse_command_line(line: &Bytes) -> Result<CommandHeader, ParseError> {
         b"version" => parse_version(&mut tokenizer),
         b"verbosity" => parse_verbosity(&mut tokenizer),
         b"stats" => parse_stats(&mut tokenizer),
+        b"quit" => Ok(CommandHeader::Quit),
         _ => Err(ParseError::new(ParseErrorKind::Unknown)),
     }
 }
@@ -415,7 +417,7 @@ mod tests {
                 assert_eq!(pending.len, 5);
                 assert!(!pending.noreply)
             }
-            CommandHeader::Immediate(_) => panic!("expected a pending store"),
+            CommandHeader::Immediate(_) | CommandHeader::Quit => panic!("expected a pending store"),
         }
     }
 
