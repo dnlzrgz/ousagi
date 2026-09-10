@@ -43,6 +43,11 @@ pub enum Command {
         delta: u64,
         noreply: bool,
     },
+    GetAndTouch {
+        keys: Vec<Bytes>,
+        exptime: i64,
+        with_cas: bool,
+    },
     Touch {
         key: Bytes,
         exptime: i64,
@@ -61,12 +66,10 @@ pub enum Command {
 }
 
 impl Command {
-    /// Whether the client asked to avoid the reply for the command. `get` always replies, so `Get`
-    /// always has to return `false`. Centralizing the check here means `process` doesn't need to
-    /// match on `Command` again just to find the flag.
     pub(crate) fn noreply(&self) -> bool {
         match self {
             Command::Get { .. } => false,
+            Command::GetAndTouch { .. } => false,
             Command::Stats { .. } => false,
             Command::Version => false,
             Command::Store(_, args) => args.noreply,

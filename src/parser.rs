@@ -139,6 +139,7 @@ pub fn parse_command_line(line: &Bytes) -> Result<CommandHeader, ParseError> {
 
     match op {
         b"get" | b"gets" => parse_get(op == b"gets", &mut tokenizer),
+        b"gat" | b"gats" => parse_get_and_touch(op == b"gats", &mut tokenizer),
         b"add" => parse_store(StoreOp::Add, &mut tokenizer),
         b"set" => parse_store(StoreOp::Set, &mut tokenizer),
         b"replace" => parse_store(StoreOp::Replace, &mut tokenizer),
@@ -204,6 +205,33 @@ fn parse_get(with_cas: bool, tokenizer: &mut Tokenizer) -> Result<CommandHeader,
     }
 
     Ok(CommandHeader::Immediate(Command::Get { keys, with_cas }))
+}
+
+fn parse_get_and_touch(
+    with_cas: bool,
+    tokenizer: &mut Tokenizer,
+) -> Result<CommandHeader, ParseError> {
+    let exptime = tokenizer
+        .next()
+        .ok_or_else(|| ParseError::new(ParseErrorKind::Unknown))?;
+    let exptime: i64 =
+        parse_field(exptime).map_err(|_| ParseError::new(ParseErrorKind::BadFormat))?;
+
+    let first_key = tokenizer
+        .next()
+        .ok_or_else(|| ParseError::new(ParseErrorKind::Unknown))?;
+
+    let mut keys = Vec::with_capacity(6);
+    keys.push(tokenizer.extract_key(first_key)?);
+    while let Some(k) = tokenizer.next() {
+        keys.push(tokenizer.extract_key(k)?);
+    }
+
+    Ok(CommandHeader::Immediate(Command::GetAndTouch {
+        keys,
+        exptime,
+        with_cas,
+    }))
 }
 
 fn parse_store(op: StoreOp, tokenizer: &mut Tokenizer) -> Result<CommandHeader, ParseError> {

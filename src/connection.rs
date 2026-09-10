@@ -313,6 +313,62 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
 
             Response::Values(values)
         }
+        Command::GetAndTouch {
+            keys,
+            exptime,
+            with_cas,
+        } => {
+            tracing::debug!(?keys, exptime, with_cas, "gat");
+
+            Stats::incr(&store.stats.cmd_get, keys.len() as u64);
+
+            let oldest_live = store.oldest_live();
+            let mut expired_keys = Vec::with_capacity(6);
+            let mut values = Vec::with_capacity(6);
+
+            for key in keys {
+                match store.items.entry(key.clone()) {
+                    Entry::Occupied(entry) if entry.get().is_expired(now, oldest_live) => {
+                        Stats::incr(&store.stats.get_expired, 1);
+                        Stats::incr(&store.stats.get_misses, 1);
+                        expired_keys.push(key);
+                    }
+                    Entry::Occupied(mut entry) => {
+                        Stats::incr(&store.stats.get_hits, 1);
+
+                        let old_item = entry.get();
+                        let cas = store.next_cas();
+                        let expires_at = Item::resolve_expiry(exptime, now);
+                        let touched = Item::with_parts(
+                            old_item.data().clone(),
+                            old_item.flags(),
+                            expires_at,
+                            cas,
+                            old_item.stored_at(),
+                        );
+
+                        let flags = touched.flags();
+                        let data = touched.data().clone();
+                        entry.insert(touched);
+
+                        values.push((key, flags, data, with_cas.then_some(cas)));
+                    }
+                    Entry::Vacant(_) => {
+                        Stats::incr(&store.stats.get_misses, 1);
+                    }
+                }
+            }
+
+            for key in expired_keys {
+                if let Entry::Occupied(entry) = store.items.entry(key)
+                    && entry.get().is_expired(now, oldest_live)
+                {
+                    entry.remove();
+                }
+            }
+
+            Response::Values(values)
+        }
         Command::Store(op, args) => {
             tracing::debug!(?op, key = ?args.key, len = args.data.len(), exptime = args.exptime, "store");
 
