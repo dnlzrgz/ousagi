@@ -47,6 +47,7 @@ pub enum Command {
         delay: Option<u32>,
         noreply: bool,
     },
+    Version,
     Stats,
 }
 
@@ -58,6 +59,7 @@ impl Command {
         match self {
             Command::Get { .. } => false,
             Command::Stats { .. } => false,
+            Command::Version => false,
             Command::Store(_, args) => args.noreply,
             Command::Delete { noreply, .. }
             | Command::Arithmetic { noreply, .. }
@@ -77,6 +79,7 @@ pub enum Response {
     Values(Vec<(Bytes, u32, Bytes, Option<u64>)>),
     Number(u64),
     Ok,
+    Version(&'static str),
     Error,
     ClientError(&'static str),
     ServerError(&'static str),

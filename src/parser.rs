@@ -148,6 +148,7 @@ pub fn parse_command_line(line: &Bytes) -> Result<CommandHeader, ParseError> {
         b"incr" => parse_arithmetic(ArithmeticOp::Incr, &mut tokenizer),
         b"decr" => parse_arithmetic(ArithmeticOp::Decr, &mut tokenizer),
         b"flush_all" => parse_flush_all(&mut tokenizer),
+        b"version" => parse_version(&mut tokenizer),
         b"stats" => parse_stats(&mut tokenizer),
         _ => Err(ParseError::new(ParseErrorKind::Unknown)),
     }
@@ -306,9 +307,17 @@ fn parse_flush_all(tokenizer: &mut Tokenizer) -> Result<CommandHeader, ParseErro
     }))
 }
 
+fn parse_version(tokenizer: &mut Tokenizer) -> Result<CommandHeader, ParseError> {
+    if tokenizer.next().is_some() {
+        return Err(ParseError::new(ParseErrorKind::BadFormat));
+    }
+
+    Ok(CommandHeader::Immediate(Command::Version))
+}
+
 fn parse_stats(tokenizer: &mut Tokenizer) -> Result<CommandHeader, ParseError> {
     if tokenizer.next().is_some() {
-        // TODO: add support for subcomamnds
+        // TODO: add optional subcommands
         return Err(ParseError::new(ParseErrorKind::BadFormat));
     }
 

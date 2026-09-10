@@ -14,6 +14,8 @@ use crate::{
     store::{Item, Store},
 };
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 const MAX_LINE_LEN: u64 = 8 * 1024; // bytes
 
 #[derive(Debug)]
@@ -49,7 +51,7 @@ pub struct Connection<R, W> {
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
     pub fn new(reader: R, writer: W) -> Self {
         Connection {
-            reader: reader,
+            reader,
             writer: BufWriter::new(writer),
             buffer: BytesMut::new(),
         }
@@ -169,6 +171,11 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
             }
             Response::Error => self.writer.write_all(b"ERROR\r\n").await?,
             Response::Ok => self.writer.write_all(b"OK\r\n").await?,
+            Response::Version(version) => {
+                self.writer.write_all(b"VERSION ").await?;
+                self.writer.write_all(version.as_bytes()).await?;
+                self.writer.write_all(b"\r\n").await?;
+            }
             Response::ClientError(msg) => {
                 self.writer.write_all(b"CLIENT_ERROR ").await?;
                 self.writer.write_all(msg.as_bytes()).await?;
@@ -479,6 +486,10 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
 
             Response::Ok
         }
+        Command::Version => {
+            tracing::debug!("version");
+            Response::Version(VERSION)
+        }
         Command::Stats => {
             tracing::debug!("stats");
             Response::Stats(store.stats.report(store.items.len()))
@@ -511,17 +522,18 @@ mod tests {
     use tokio::io::{DuplexStream, ReadHalf, WriteHalf, duplex, split};
 
     const TEST_NOW: u64 = 1_000_000;
+    const TEST_THREADS: usize = 1;
 
     /// Fresh, empty Store.
     fn empty_store() -> Store {
         let shared_clock = Clock::mock(TEST_NOW);
-        Arc::new(StoreInner::new(shared_clock))
+        Arc::new(StoreInner::new(shared_clock, TEST_THREADS))
     }
 
     /// Store pre-populated with one item under `key`.
     fn store_with(key: &str, item: Item) -> Store {
         let shared_clock = Clock::mock(TEST_NOW);
-        let inner = StoreInner::new(shared_clock);
+        let inner = StoreInner::new(shared_clock, TEST_THREADS);
         inner
             .items
             .insert(Bytes::copy_from_slice(key.as_bytes()), item);
@@ -1048,5 +1060,17 @@ mod tests {
         assert_eq!(store.stats.cmd_get.load(Relaxed), 3);
         assert_eq!(store.stats.get_hits.load(Relaxed), 1);
         assert_eq!(store.stats.get_misses.load(Relaxed), 2);
+    }
+
+    #[test]
+    fn version_returns_cargo_package_version() {
+        let cmd = Command::Version;
+
+        let resp = execute(cmd, &empty_store());
+
+        match resp {
+            Response::Version(version) => assert_eq!(version, env!("CARGO_PKG_VERSION")),
+            other => panic!("expected Version response, got {:?}", other),
+        }
     }
 }
