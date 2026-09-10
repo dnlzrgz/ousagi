@@ -48,6 +48,10 @@ pub enum Command {
         noreply: bool,
     },
     Version,
+    Verbosity {
+        level: u32,
+        noreply: bool,
+    },
     Stats,
 }
 
@@ -63,7 +67,8 @@ impl Command {
             Command::Store(_, args) => args.noreply,
             Command::Delete { noreply, .. }
             | Command::Arithmetic { noreply, .. }
-            | Command::FlushAll { noreply, .. } => *noreply,
+            | Command::FlushAll { noreply, .. }
+            | Command::Verbosity { noreply, .. } => *noreply,
         }
     }
 }

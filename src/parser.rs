@@ -149,6 +149,7 @@ pub fn parse_command_line(line: &Bytes) -> Result<CommandHeader, ParseError> {
         b"decr" => parse_arithmetic(ArithmeticOp::Decr, &mut tokenizer),
         b"flush_all" => parse_flush_all(&mut tokenizer),
         b"version" => parse_version(&mut tokenizer),
+        b"verbosity" => parse_verbosity(&mut tokenizer),
         b"stats" => parse_stats(&mut tokenizer),
         _ => Err(ParseError::new(ParseErrorKind::Unknown)),
     }
@@ -214,11 +215,10 @@ fn parse_store(op: StoreOp, tokenizer: &mut Tokenizer) -> Result<CommandHeader, 
     };
 
     let key = tokenizer.extract_key(key)?;
-    let flags =
-        parse_field::<u32>(flags).map_err(|_| ParseError::new(ParseErrorKind::BadFormat))?;
-    let exptime =
-        parse_field::<i64>(exptime).map_err(|_| ParseError::new(ParseErrorKind::BadFormat))?;
-    let len = parse_field::<usize>(len).map_err(|_| ParseError::new(ParseErrorKind::BadFormat))?;
+    let flags: u32 = parse_field(flags).map_err(|_| ParseError::new(ParseErrorKind::BadFormat))?;
+    let exptime: i64 =
+        parse_field(exptime).map_err(|_| ParseError::new(ParseErrorKind::BadFormat))?;
+    let len: usize = parse_field(len).map_err(|_| ParseError::new(ParseErrorKind::BadFormat))?;
 
     if len > MAX_ITEM_SIZE {
         return Err(ParseError::new(ParseErrorKind::TooLarge).with_discard(len + 2));
@@ -272,8 +272,8 @@ fn parse_arithmetic(
     };
 
     let key = tokenizer.extract_key(key)?;
-    let delta =
-        parse_field::<u64>(delta).map_err(|_| ParseError::new(ParseErrorKind::NumericDelta))?;
+    let delta: u64 =
+        parse_field(delta).map_err(|_| ParseError::new(ParseErrorKind::NumericDelta))?;
     let noreply = parse_noreply(tokenizer)?;
 
     Ok(CommandHeader::Immediate(Command::Arithmetic {
@@ -294,8 +294,8 @@ fn parse_flush_all(tokenizer: &mut Tokenizer) -> Result<CommandHeader, ParseErro
             (None, true)
         }
         Some(d) => {
-            let delay =
-                parse_field::<u32>(d).map_err(|_| ParseError::new(ParseErrorKind::NumericDelay))?;
+            let delay: u32 =
+                parse_field(d).map_err(|_| ParseError::new(ParseErrorKind::NumericDelay))?;
             let noreply = parse_noreply(tokenizer)?;
             (Some(delay), noreply)
         }
@@ -313,6 +313,20 @@ fn parse_version(tokenizer: &mut Tokenizer) -> Result<CommandHeader, ParseError>
     }
 
     Ok(CommandHeader::Immediate(Command::Version))
+}
+
+fn parse_verbosity(tokenizer: &mut Tokenizer) -> Result<CommandHeader, ParseError> {
+    let level = tokenizer
+        .next()
+        .ok_or_else(|| ParseError::new(ParseErrorKind::Unknown))?;
+    let level: u32 = parse_field(level).map_err(|_| ParseError::new(ParseErrorKind::BadFormat))?;
+
+    let noreply = parse_noreply(tokenizer)?;
+
+    Ok(CommandHeader::Immediate(Command::Verbosity {
+        level,
+        noreply,
+    }))
 }
 
 fn parse_stats(tokenizer: &mut Tokenizer) -> Result<CommandHeader, ParseError> {

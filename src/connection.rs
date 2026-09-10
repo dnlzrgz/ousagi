@@ -490,6 +490,11 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
             tracing::debug!("version");
             Response::Version(VERSION)
         }
+        // `verbosity` is handled for compatibility but is a no-op.
+        Command::Verbosity { level, noreply: _ } => {
+            tracing::debug!(?level, "verbosity");
+            Response::Ok
+        }
         Command::Stats => {
             tracing::debug!("stats");
             Response::Stats(store.stats.report(store.items.len()))
