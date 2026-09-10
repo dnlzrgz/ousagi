@@ -186,6 +186,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                 self.writer.write_all(msg.as_bytes()).await?;
                 self.writer.write_all(b"\r\n").await?;
             }
+            Response::Touched => self.writer.write_all(b"TOUCHED\r\n").await?,
             Response::Values(values) => {
                 let mut itoa_buf = itoa::Buffer::new();
                 let mut header_buf = BytesMut::with_capacity(256);
@@ -468,6 +469,35 @@ pub(crate) fn execute(cmd: Command, store: &Store) -> Response {
                     Stats::incr(misses, 1);
                     Response::NotFound
                 }
+            }
+        }
+        Command::Touch {
+            key,
+            exptime,
+            noreply: _,
+        } => {
+            tracing::debug!(?key, ?exptime, "touch");
+
+            let oldest_live = store.oldest_live();
+            let cas = store.next_cas();
+
+            match store.items.entry(key) {
+                Entry::Occupied(mut entry) if !entry.get().is_expired(now, oldest_live) => {
+                    let old_item = entry.get();
+
+                    let expires_at = Item::resolve_expiry(exptime, now);
+                    let touched = Item::with_parts(
+                        old_item.data().clone(),
+                        old_item.flags(),
+                        expires_at,
+                        cas,
+                        old_item.stored_at(),
+                    );
+
+                    entry.insert(touched);
+                    Response::Touched
+                }
+                _ => Response::NotFound,
             }
         }
         Command::FlushAll { delay, noreply: _ } => {

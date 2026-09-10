@@ -147,6 +147,7 @@ pub fn parse_command_line(line: &Bytes) -> Result<CommandHeader, ParseError> {
         b"delete" => parse_delete(&mut tokenizer),
         b"incr" => parse_arithmetic(ArithmeticOp::Incr, &mut tokenizer),
         b"decr" => parse_arithmetic(ArithmeticOp::Decr, &mut tokenizer),
+        b"touch" => parse_touch(&mut tokenizer),
         b"flush_all" => parse_flush_all(&mut tokenizer),
         b"version" => parse_version(&mut tokenizer),
         b"verbosity" => parse_verbosity(&mut tokenizer),
@@ -280,6 +281,23 @@ fn parse_arithmetic(
         op,
         key,
         delta,
+        noreply,
+    }))
+}
+
+fn parse_touch(tokenizer: &mut Tokenizer) -> Result<CommandHeader, ParseError> {
+    let (key, exptime) = match (tokenizer.next(), tokenizer.next()) {
+        (Some(key), Some(exptime)) => (key, exptime),
+        _ => return Err(ParseError::new(ParseErrorKind::Unknown)),
+    };
+    let key = tokenizer.extract_key(key)?;
+    let exptime: i64 =
+        parse_field(exptime).map_err(|_| ParseError::new(ParseErrorKind::BadFormat))?;
+    let noreply = parse_noreply(tokenizer)?;
+
+    Ok(CommandHeader::Immediate(Command::Touch {
+        key,
+        exptime,
         noreply,
     }))
 }

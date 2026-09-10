@@ -20,18 +20,20 @@ pub struct Item {
 }
 
 impl Item {
-    pub(crate) fn new(data: Bytes, flags: u32, exptime: i64, cas: u64, now: u64) -> Self {
-        let expires_at = match exptime {
+    pub(crate) fn resolve_expiry(exptime: i64, now: u64) -> Option<u64> {
+        match exptime {
             0 => None,
             n if n < 0 => Some(0),
             n if n <= THIRTY_DAYS_SECS => Some(now + n as u64),
             n => Some(n as u64),
-        };
+        }
+    }
 
+    pub(crate) fn new(data: Bytes, flags: u32, exptime: i64, cas: u64, now: u64) -> Self {
         Self {
             data,
             flags,
-            expires_at,
+            expires_at: Self::resolve_expiry(exptime, now),
             cas,
             stored_at: now,
         }

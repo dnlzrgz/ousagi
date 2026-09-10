@@ -43,6 +43,11 @@ pub enum Command {
         delta: u64,
         noreply: bool,
     },
+    Touch {
+        key: Bytes,
+        exptime: i64,
+        noreply: bool,
+    },
     FlushAll {
         delay: Option<u32>,
         noreply: bool,
@@ -67,6 +72,7 @@ impl Command {
             Command::Store(_, args) => args.noreply,
             Command::Delete { noreply, .. }
             | Command::Arithmetic { noreply, .. }
+            | Command::Touch { noreply, .. }
             | Command::FlushAll { noreply, .. }
             | Command::Verbosity { noreply, .. } => *noreply,
         }
@@ -81,6 +87,7 @@ pub enum Response {
     Deleted,
     NotFound,
     Exists,
+    Touched,
     Values(Vec<(Bytes, u32, Bytes, Option<u64>)>),
     Number(u64),
     Ok,
