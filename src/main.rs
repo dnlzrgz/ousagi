@@ -1,66 +1,34 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use clap::{ArgAction, Parser};
+use clap::Parser;
+use tokio::{net::TcpListener, sync::Semaphore};
+use tracing_subscriber::EnvFilter;
+
 use ousagi::{
+    cli::Cli,
     clock::spawn_clock,
     connection,
     store::{Store, StoreInner},
 };
-use tokio::{net::TcpListener, sync::Semaphore};
-use tracing_subscriber::EnvFilter;
 
-#[derive(Parser, Debug)]
-pub struct Args {
-    /// TCP port to listen on (0 to disable)
-    #[arg(short = 'p', long, default_value_t = 11211)]
-    pub port: u16,
-
-    /// Interface to listen on, default INADDR_ANY
-    #[arg(short = 'l', long)]
-    pub listen: Option<String>,
-
-    /// Number of threads to process incoming requests
-    #[arg(short = 't', long, default_value_t = 4, value_parser = parse_threads)]
-    pub threads: usize,
-
-    /// Max simultaneous client connections
-    #[arg(short = 'c', long, default_value_t = 1024)]
-    pub max_connections: usize,
-
-    /// Verbosity level
-    #[arg(short = 'v', action = ArgAction::Count)]
-    pub verbose: u8,
-}
-
-fn resolve_addr(args: &Args) -> SocketAddr {
+fn resolve_addr(args: &Cli) -> SocketAddr {
     let ip = args.listen.as_deref().unwrap_or("0.0.0.0");
     format!("{ip}:{}", args.port)
         .parse()
         .expect("invalid --listen/--port")
 }
 
-fn parse_threads(s: &str) -> Result<usize, String> {
-    let threads: usize = s
-        .parse()
-        .map_err(|_| format!("'{s}' isn't a valid number"))?;
-
-    if threads == 0 {
-        return Err("thread count must be at least 1".to_string());
-    }
-
-    Ok(threads)
-}
-
 fn verbosity_level(v: u8) -> &'static str {
     match v {
         0 => "warn",
         1 => "info",
-        _ => "debug",
+        2 => "debug",
+        _ => "trace",
     }
 }
 
 fn main() {
-    let args = Args::parse();
+    let args = Cli::parse();
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -96,7 +64,7 @@ async fn shutdown_signal() {
     }
 }
 
-async fn run(args: Args) {
+async fn run(args: Cli) {
     let addr = resolve_addr(&args);
     let listener = TcpListener::bind(addr).await.unwrap();
     tracing::info!(addr = %addr, threads = args.threads, "listening");
@@ -115,12 +83,6 @@ async fn run(args: Args) {
 
 async fn accept_loop(listener: TcpListener, store: Store, connections: Arc<Semaphore>) {
     loop {
-        let permit = connections
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore is never closed");
-
         let (socket, addr) = match listener.accept().await {
             Ok(pair) => pair,
             Err(e) => {
@@ -129,6 +91,12 @@ async fn accept_loop(listener: TcpListener, store: Store, connections: Arc<Semap
                 continue;
             }
         };
+
+        let permit = connections
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore is never closed");
 
         if let Err(e) = socket.set_nodelay(true) {
             tracing::warn!(%addr, error = %e, "failed to set TCP_NODELAY");
