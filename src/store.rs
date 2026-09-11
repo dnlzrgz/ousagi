@@ -137,3 +137,102 @@ impl StoreInner {
 
 /// Shared handle to the whole cache.
 pub type Store = Arc<StoreInner>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::Clock;
+
+    fn item_at(secs_from_now: i64, now: u64) -> Item {
+        Item::new(Bytes::from_static(b"data"), 0, secs_from_now, 1, now)
+    }
+
+    #[test]
+    fn resolve_expiry_zero_means_never_expires() {
+        assert_eq!(Item::resolve_expiry(0, 1_000), None);
+    }
+
+    #[test]
+    fn resolve_expiry_negative_means_already_expired() {
+        assert_eq!(Item::resolve_expiry(-1, 1_000), Some(0));
+    }
+
+    #[test]
+    fn resolve_expiry_relative_time_under_threshold() {
+        assert_eq!(Item::resolve_expiry(60, 1_000), Some(1_060));
+    }
+
+    #[test]
+    fn resolve_expiry_at_thirty_day_boundary_is_relative() {
+        assert_eq!(
+            Item::resolve_expiry(THIRTY_DAYS_SECS, 1_000),
+            Some(1_000 + THIRTY_DAYS_SECS as u64)
+        );
+    }
+
+    #[test]
+    fn resolve_expiry_just_over_thirty_day_boundary_is_absolute() {
+        let absolute_ts = THIRTY_DAYS_SECS + 1;
+        assert_eq!(
+            Item::resolve_expiry(absolute_ts, 1_000),
+            Some(absolute_ts as u64)
+        );
+    }
+
+    #[test]
+    fn item_expired_at_expires_at() {
+        let item = item_at(60, 1_000); // expires_at = 1_060
+        assert!(item.is_expired(1_060, None));
+    }
+
+    #[test]
+    fn item_not_expired_before_expires_at() {
+        let item = item_at(60, 1_000);
+        assert!(!item.is_expired(1_059, None));
+    }
+
+    #[test]
+    fn item_with_no_expiry_never_expires_by_time() {
+        let item = item_at(0, 1_000);
+        assert!(!item.is_expired(u64::MAX, None));
+    }
+
+    #[test]
+    fn item_expired_by_oldest_live_cutoff() {
+        let item = item_at(0, 1_000);
+        assert!(item.is_expired(1_001, Some(1_001)));
+    }
+
+    #[test]
+    fn item_stored_exactly_at_oldest_live_cutoff_not_expired() {
+        let item = item_at(0, 1_000);
+        assert!(!item.is_expired(1_000, Some(1_000)));
+    }
+
+    #[test]
+    fn next_cas_starts_at_one_and_increments() {
+        let clock = Clock::mock(1_000);
+        let store = StoreInner::new(clock, 4);
+
+        assert_eq!(store.next_cas(), 1);
+        assert_eq!(store.next_cas(), 2);
+    }
+
+    #[test]
+    fn oldest_live_defaults_to_none() {
+        let clock = Clock::mock(1_000);
+        let store = StoreInner::new(clock, 4);
+
+        assert_eq!(store.oldest_live(), None);
+    }
+
+    #[test]
+    fn flush_all_sets_oldest_live() {
+        let clock = Clock::mock(1_000);
+        let store = StoreInner::new(clock, 4);
+
+        store.flush_all(30);
+
+        assert_eq!(store.oldest_live(), Some(1_030));
+    }
+}
