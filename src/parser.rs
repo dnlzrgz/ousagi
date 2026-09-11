@@ -184,10 +184,21 @@ fn parse_field<T: FromRadix10SignedChecked>(tok: &[u8]) -> Result<T, ()> {
 }
 
 #[inline]
+fn expect_end(tokenizer: &mut Tokenizer) -> Result<(), ParseError> {
+    match tokenizer.next() {
+        None => Ok(()),
+        Some(_) => Err(ParseError::new(ParseErrorKind::BadFormat)),
+    }
+}
+
+#[inline]
 fn parse_noreply(tokenizer: &mut Tokenizer) -> Result<bool, ParseError> {
     match tokenizer.next() {
         None => Ok(false),
-        Some(b"noreply") if tokenizer.next().is_none() => Ok(true),
+        Some(b"noreply") => {
+            expect_end(tokenizer)?;
+            Ok(true)
+        }
         _ => Err(ParseError::new(ParseErrorKind::BadFormat)),
     }
 }
@@ -245,15 +256,18 @@ fn parse_store(op: StoreOp, tokenizer: &mut Tokenizer) -> Result<CommandHeader, 
         _ => return Err(ParseError::new(ParseErrorKind::Unknown)),
     };
 
-    let key = tokenizer.extract_key(key)?;
-    let flags: u32 = parse_field(flags).map_err(|_| ParseError::new(ParseErrorKind::BadFormat))?;
-    let exptime: i64 =
-        parse_field(exptime).map_err(|_| ParseError::new(ParseErrorKind::BadFormat))?;
     let len: usize = parse_field(len).map_err(|_| ParseError::new(ParseErrorKind::BadFormat))?;
-
     if len > MAX_ITEM_SIZE {
         return Err(ParseError::new(ParseErrorKind::TooLarge).with_discard(len + 2));
     }
+
+    let key = tokenizer
+        .extract_key(key)
+        .map_err(|e| e.with_discard(len + 2))?;
+    let flags: u32 = parse_field(flags)
+        .map_err(|_| ParseError::new(ParseErrorKind::BadFormat).with_discard(len + 2))?;
+    let exptime: i64 = parse_field(exptime)
+        .map_err(|_| ParseError::new(ParseErrorKind::BadFormat).with_discard(len + 2))?;
 
     let cas = if op == StoreOp::Cas {
         match tokenizer.next() {
@@ -336,9 +350,7 @@ fn parse_flush_all(tokenizer: &mut Tokenizer) -> Result<CommandHeader, ParseErro
     let (delay, noreply) = match tokenizer.next() {
         None => (None, false),
         Some(b"noreply") => {
-            if tokenizer.next().is_some() {
-                return Err(ParseError::new(ParseErrorKind::BadFormat));
-            }
+            expect_end(tokenizer)?;
             (None, true)
         }
         Some(d) => {
@@ -356,10 +368,7 @@ fn parse_flush_all(tokenizer: &mut Tokenizer) -> Result<CommandHeader, ParseErro
 }
 
 fn parse_version(tokenizer: &mut Tokenizer) -> Result<CommandHeader, ParseError> {
-    if tokenizer.next().is_some() {
-        return Err(ParseError::new(ParseErrorKind::BadFormat));
-    }
-
+    expect_end(tokenizer)?;
     Ok(CommandHeader::Immediate(Command::Version))
 }
 
@@ -378,41 +387,135 @@ fn parse_verbosity(tokenizer: &mut Tokenizer) -> Result<CommandHeader, ParseErro
 }
 
 fn parse_stats(tokenizer: &mut Tokenizer) -> Result<CommandHeader, ParseError> {
-    if tokenizer.next().is_some() {
-        // TODO: add optional subcommands
-        return Err(ParseError::new(ParseErrorKind::BadFormat));
-    }
-
+    // TODO: add optional subcommands
+    expect_end(tokenizer)?;
     Ok(CommandHeader::Immediate(Command::Stats))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::panic;
 
+    /// Build a `Bytes` command line the same way the client would do
     fn line(s: &str) -> Bytes {
         Bytes::copy_from_slice(s.as_bytes())
     }
 
-    #[test]
-    fn get_single_key_parses_correctly() {
-        let header = parse_command_line(&line("get foo")).expect("should parse correctly");
+    /// Parse and unwrap an `Immediate` command
+    fn expect_immediate(input: &str) -> Command {
+        match parse_command_line(&line(input)).expect("should parse correctly") {
+            CommandHeader::Immediate(cmd) => cmd,
+            other => panic!("expected Immediate command, got {other:?}"),
+        }
+    }
 
-        match header {
-            CommandHeader::Immediate(Command::Get { keys, with_cas }) => {
+    /// Parse and unwrap a `Store` header
+    fn expect_store(input: &str) -> PendingStore {
+        match parse_command_line(&line(input)).expect("should parse correctly") {
+            CommandHeader::Store(pending) => pending,
+            other => panic!("expected Immediate command, got {other:?}"),
+        }
+    }
+
+    /// Parse and unwrap a bad input, panics if it unexpectly success
+    fn expect_error(input: &str) -> ParseError {
+        parse_command_line(&line(input)).expect_err("should fail to parse")
+    }
+
+    #[test]
+    fn empty_line_fails_with_unknown() {
+        let err = expect_error("");
+        assert!(matches!(err.kind, ParseErrorKind::Unknown));
+        assert_eq!(err.discard(), None);
+    }
+
+    #[test]
+    fn tokenizer_skips_leading_and_trailing_spaces() {
+        match expect_immediate(" get foo ") {
+            Command::Get { keys, with_cas } => {
                 assert_eq!(keys, vec![Bytes::from_static(b"foo")]);
                 assert!(!with_cas);
             }
-            _ => panic!("expected Get command without cas"),
+            other => panic!("expected Get command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tokenizer_skips_repeated_spaces_between_tokens() {
+        match expect_immediate("get    foo") {
+            Command::Get { keys, with_cas } => {
+                assert_eq!(keys, vec![Bytes::from_static(b"foo")]);
+                assert!(!with_cas);
+            }
+            other => panic!("expected Get command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_command_fails() {
+        let err = expect_error("foo get");
+
+        assert!(matches!(err.kind, ParseErrorKind::Unknown));
+        assert_eq!(err.discard(), None);
+    }
+
+    #[test]
+    fn key_at_max_length_parses_correctly() {
+        let key = "a".repeat(MAX_KEY_LEN);
+        let input = format!("get {key}");
+
+        match expect_immediate(&input) {
+            Command::Get { keys, with_cas } => {
+                assert_eq!(keys, vec![Bytes::copy_from_slice(key.as_bytes())]);
+                assert!(!with_cas);
+            }
+            other => panic!("expected Get command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn key_exceeding_max_length_fails() {
+        let key = "a".repeat(MAX_KEY_LEN + 1);
+        let input = format!("get {key}");
+
+        let err = expect_error(&input);
+
+        assert!(matches!(err.kind, ParseErrorKind::BadFormat));
+        assert_eq!(err.discard(), None);
+    }
+
+    #[test]
+    fn key_with_control_character_fails() {
+        let err = expect_error("get foo\x01bar");
+
+        assert!(matches!(err.kind, ParseErrorKind::BadFormat));
+        assert_eq!(err.discard(), None);
+    }
+
+    #[test]
+    fn key_with_del_byte_fails() {
+        let err = expect_error("get foo\x7Fbar");
+
+        assert!(matches!(err.kind, ParseErrorKind::BadFormat));
+        assert_eq!(err.discard(), None);
+    }
+
+    #[test]
+    fn get_single_key_parses_correctly() {
+        match expect_immediate("get foo") {
+            Command::Get { keys, with_cas } => {
+                assert_eq!(keys, vec![Bytes::from_static(b"foo")]);
+                assert!(!with_cas);
+            }
+            other => panic!("expected GetAndTouch command, got {other:?}"),
         }
     }
 
     #[test]
     fn get_multiple_keys_parses_correctly() {
-        let header = parse_command_line(&line("get foo bar baz")).expect("should parse correctly");
-
-        match header {
-            CommandHeader::Immediate(Command::Get { keys, with_cas }) => {
+        match expect_immediate("get foo bar baz") {
+            Command::Get { keys, with_cas } => {
                 assert_eq!(
                     keys,
                     vec![
@@ -423,60 +526,443 @@ mod tests {
                 );
                 assert!(!with_cas);
             }
-            _ => panic!("expected Get command without cas"),
+            other => panic!("expected GetAndTouch command, got {other:?}"),
         }
     }
 
     #[test]
     fn get_with_no_keys_fails() {
-        let err = parse_command_line(&line("get")).unwrap_err();
+        let err = expect_error("get");
+
         assert!(matches!(err.kind, ParseErrorKind::Unknown));
+        assert_eq!(err.discard(), None);
     }
 
     #[test]
-    fn set_returns_pendig_store_with_fields_parsed_correctly() {
-        let header = parse_command_line(&line("set foo 42 0 5")).expect("should parse correctly");
-
-        match header {
-            CommandHeader::Store(pending) => {
-                assert!(matches!(pending.op, StoreOp::Set));
-                assert_eq!(pending.key, Bytes::from_static(b"foo"));
-                assert_eq!(pending.flags, 42);
-                assert_eq!(pending.len, 5);
-                assert!(!pending.noreply)
+    fn gets_sets_with_cas_true() {
+        match expect_immediate("gets foo") {
+            Command::Get { keys, with_cas } => {
+                assert_eq!(keys, vec![Bytes::from_static(b"foo")]);
+                assert!(with_cas);
             }
-            CommandHeader::Immediate(_) | CommandHeader::Quit => panic!("expected a pending store"),
+            other => panic!("expected Get command, got {other:?}"),
         }
     }
 
     #[test]
+    fn gat_single_key_parses_correctly() {
+        match expect_immediate("gat 100 foo") {
+            Command::GetAndTouch {
+                keys,
+                exptime,
+                with_cas,
+            } => {
+                assert_eq!(keys, vec![Bytes::from_static(b"foo")]);
+                assert_eq!(exptime, 100);
+                assert!(!with_cas);
+            }
+            other => panic!("expected GetAndTouch command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gat_multiple_keys_parses_correctly() {
+        match expect_immediate("gat 100 foo bar baz") {
+            Command::GetAndTouch {
+                keys,
+                exptime,
+                with_cas,
+            } => {
+                assert_eq!(
+                    keys,
+                    vec![
+                        Bytes::from_static(b"foo"),
+                        Bytes::from_static(b"bar"),
+                        Bytes::from_static(b"baz")
+                    ]
+                );
+                assert_eq!(exptime, 100);
+                assert!(!with_cas);
+            }
+            other => panic!("expected GetAndTouch command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gats_sets_with_cas_true() {
+        match expect_immediate("gats 100 foo") {
+            Command::GetAndTouch {
+                keys,
+                exptime,
+                with_cas,
+            } => {
+                assert_eq!(keys, vec![Bytes::from_static(b"foo")]);
+                assert_eq!(exptime, 100);
+                assert!(with_cas);
+            }
+            other => panic!("expected GetAndTouch command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gat_with_missing_exptime_fails() {
+        let err = expect_error("gat foo");
+
+        assert!(matches!(err.kind, ParseErrorKind::BadFormat));
+        assert_eq!(err.discard(), None);
+    }
+
+    #[test]
+    fn gat_non_numeric_exptime_fails() {
+        let err = expect_error("gat abc foo");
+
+        assert!(matches!(err.kind, ParseErrorKind::BadFormat));
+        assert_eq!(err.discard(), None);
+    }
+
+    #[test]
+    fn gat_with_exptime_but_no_keys_fails() {
+        let err = expect_error("gat 100");
+
+        assert!(matches!(err.kind, ParseErrorKind::Unknown));
+        assert_eq!(err.discard(), None);
+    }
+
+    #[test]
+    fn set_with_invalid_flags_discards_payload() {
+        let err = expect_error("set foo not_a_number 0 5");
+
+        assert!(matches!(err.kind, ParseErrorKind::BadFormat));
+        assert_eq!(err.discard(), Some(5 + 2));
+    }
+    #[test]
+    fn set_parses_all_fields_correctly() {
+        let pending = expect_store("set foo 42 0 5");
+
+        assert!(matches!(pending.op, StoreOp::Set));
+        assert_eq!(pending.key, Bytes::from_static(b"foo"));
+        assert_eq!(pending.flags, 42);
+        assert_eq!(pending.exptime, 0);
+        assert_eq!(pending.len, 5);
+        assert_eq!(pending.cas, None);
+        assert!(!pending.noreply);
+    }
+
+    #[test]
     fn set_item_larger_than_max_item_size_fails() {
-        let command = format!("set foo 0 0 {}", MAX_ITEM_SIZE + 1);
-        let err = parse_command_line(&line(&command)).unwrap_err();
+        let input = format!("set foo 0 0 {}", MAX_ITEM_SIZE + 1);
+        let err = expect_error(&input);
 
         assert!(matches!(err.kind, ParseErrorKind::TooLarge));
         assert_eq!(err.discard(), Some(MAX_ITEM_SIZE + 1 + 2));
     }
 
     #[test]
-    fn unknown_command_fails() {
-        let err = parse_command_line(&line("foo get")).unwrap_err();
-        assert!(matches!(err.kind, ParseErrorKind::Unknown));
+    fn set_item_at_max_item_size_parses_correctly() {
+        let input = format!("set foo 0 0 {MAX_ITEM_SIZE}");
+        let pending = expect_store(&input);
+
+        assert_eq!(pending.len, MAX_ITEM_SIZE);
     }
 
     #[test]
-    fn stats_parses_to_stats_command() {
-        let header = parse_command_line(&line("stats")).expect("should parse correctly");
+    fn set_with_invalid_key_and_valid_len_discards_payload() {
+        let err = expect_error("set fo\x01o 0 0 5");
 
-        match header {
-            CommandHeader::Immediate(Command::Stats) => {}
-            _ => panic!("expected Stats command"),
+        assert!(matches!(err.kind, ParseErrorKind::BadFormat));
+        assert_eq!(err.discard(), Some(5 + 2));
+    }
+
+    #[test]
+    fn set_with_invalid_exptime_discards_payload() {
+        let err = expect_error("set foo 0 abc 5");
+
+        assert!(matches!(err.kind, ParseErrorKind::BadFormat));
+        assert_eq!(err.discard(), Some(5 + 2));
+    }
+
+    #[test]
+    fn set_missing_fields_fails() {
+        let err = expect_error("set foo 0 0");
+
+        assert!(matches!(err.kind, ParseErrorKind::Unknown));
+        assert_eq!(err.discard(), None);
+    }
+
+    #[test]
+    fn set_noreply_parses_correctly() {
+        let pending = expect_store("set foo 0 0 5 noreply");
+
+        assert!(pending.noreply);
+    }
+
+    #[test]
+    fn add_parses_correctly() {
+        let pending = expect_store("add foo 0 0 5");
+
+        assert!(matches!(pending.op, StoreOp::Add));
+    }
+
+    #[test]
+    fn replace_parses_correctly() {
+        let pending = expect_store("replace foo 0 0 5");
+
+        assert!(matches!(pending.op, StoreOp::Replace));
+    }
+
+    #[test]
+    fn append_parses_correctly() {
+        let pending = expect_store("append foo 0 0 5");
+
+        assert!(matches!(pending.op, StoreOp::Append));
+    }
+
+    #[test]
+    fn prepend_parses_correctly() {
+        let pending = expect_store("prepend foo 0 0 5");
+
+        assert!(matches!(pending.op, StoreOp::Prepend));
+    }
+
+    #[test]
+    fn cas_with_valid_token_parses_correctly() {
+        let pending = expect_store("cas foo 0 0 5 8");
+
+        assert!(matches!(pending.op, StoreOp::Cas));
+        assert_eq!(pending.cas, Some(8));
+    }
+
+    #[test]
+    fn cas_missing_cas_token_fails() {
+        let err = expect_error("cas foo 0 0 5");
+
+        assert!(matches!(err.kind, ParseErrorKind::BadFormat));
+        assert_eq!(err.discard(), Some(5 + 2));
+    }
+
+    #[test]
+    fn cas_non_numeric_cas_token_fails() {
+        let err = expect_error("cas foo 0 0 5 abc");
+
+        assert!(matches!(err.kind, ParseErrorKind::BadFormat));
+        assert_eq!(err.discard(), Some(5 + 2));
+    }
+
+    #[test]
+    fn delete_parses_correctly() {
+        match expect_immediate("delete foo") {
+            Command::Delete { key, noreply } => {
+                assert_eq!(key, Bytes::from_static(b"foo"));
+                assert!(!noreply);
+            }
+            other => panic!("expected Delete command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_missing_key_fails() {
+        let err = expect_error("delete");
+
+        assert!(matches!(err.kind, ParseErrorKind::Unknown));
+        assert_eq!(err.discard(), None);
+    }
+
+    #[test]
+    fn delete_noreply_parses_correctly() {
+        match expect_immediate("delete foo noreply") {
+            Command::Delete { noreply, .. } => assert!(noreply),
+            other => panic!("expected Delete command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn incr_parses_correctly() {
+        match expect_immediate("incr foo 5") {
+            Command::Arithmetic {
+                op,
+                key,
+                delta,
+                noreply,
+            } => {
+                assert!(matches!(op, ArithmeticOp::Incr));
+                assert_eq!(key, Bytes::from_static(b"foo"));
+                assert_eq!(delta, 5);
+                assert!(!noreply);
+            }
+            other => panic!("expected Arithmetic command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decr_parses_correctly() {
+        match expect_immediate("decr foo 5") {
+            Command::Arithmetic { op, .. } => assert!(matches!(op, ArithmeticOp::Decr)),
+            other => panic!("expected Arithmetic command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn incr_non_numeric_delta_fails() {
+        let err = expect_error("incr foo abc");
+
+        assert!(matches!(err.kind, ParseErrorKind::NumericDelta));
+        assert_eq!(err.discard(), None);
+    }
+
+    #[test]
+    fn incr_negative_delta_fails() {
+        let err = expect_error("incr foo -5");
+
+        assert!(matches!(err.kind, ParseErrorKind::NumericDelta));
+        assert_eq!(err.discard(), None);
+    }
+
+    #[test]
+    fn touch_parses_correctly() {
+        match expect_immediate("touch foo 100") {
+            Command::Touch {
+                key,
+                exptime,
+                noreply,
+            } => {
+                assert_eq!(key, Bytes::from_static(b"foo"));
+                assert_eq!(exptime, 100);
+                assert!(!noreply);
+            }
+            other => panic!("expected Touch command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn touch_missing_exptime_fails() {
+        let err = expect_error("touch foo");
+
+        assert!(matches!(err.kind, ParseErrorKind::Unknown));
+        assert_eq!(err.discard(), None);
+    }
+
+    #[test]
+    fn touch_non_numeric_exptime_fails() {
+        let err = expect_error("touch foo abc");
+
+        assert!(matches!(err.kind, ParseErrorKind::BadFormat));
+        assert_eq!(err.discard(), None);
+    }
+
+    #[test]
+    fn flush_all_with_no_args_parses_correctly() {
+        match expect_immediate("flush_all") {
+            Command::FlushAll { delay, noreply } => {
+                assert_eq!(delay, None);
+                assert!(!noreply);
+            }
+            other => panic!("expected FlushAll command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flush_all_with_delay_parses_correctly() {
+        match expect_immediate("flush_all 30") {
+            Command::FlushAll { delay, noreply } => {
+                assert_eq!(delay, Some(30));
+                assert!(!noreply);
+            }
+            other => panic!("expected FlushAll command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flush_all_noreply_parses_correctly() {
+        match expect_immediate("flush_all noreply") {
+            Command::FlushAll { delay, noreply } => {
+                assert_eq!(delay, None);
+                assert!(noreply);
+            }
+            other => panic!("expected FlushAll command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flush_all_with_delay_and_noreply_parses_correctly() {
+        match expect_immediate("flush_all 30 noreply") {
+            Command::FlushAll { delay, noreply } => {
+                assert_eq!(delay, Some(30));
+                assert!(noreply);
+            }
+            other => panic!("expected FlushAll command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flush_all_noreply_followed_by_trailing_token_fails() {
+        let err = expect_error("flush_all noreply foo");
+
+        assert!(matches!(err.kind, ParseErrorKind::BadFormat));
+        assert_eq!(err.discard(), None);
+    }
+
+    #[test]
+    fn flush_all_non_numeric_delay_fails() {
+        let err = expect_error("flush_all abc");
+
+        assert!(matches!(err.kind, ParseErrorKind::NumericDelay));
+        assert_eq!(err.discard(), None);
+    }
+
+    #[test]
+    fn version_parses_correctly() {
+        match expect_immediate("version") {
+            Command::Version => {}
+            other => panic!("expected Version command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verbosity_parses_correctly() {
+        match expect_immediate("verbosity 100") {
+            Command::Verbosity { level, noreply } => {
+                assert_eq!(level, 100);
+                assert!(!noreply);
+            }
+            other => panic!("expected Verbosity command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verbosity_with_trailing_token_fails() {
+        let err = expect_error("verbosity 100 foo");
+        assert!(matches!(err.kind, ParseErrorKind::BadFormat));
+        assert_eq!(err.discard(), None);
+    }
+
+    #[test]
+    fn verbosity_non_numeric_level_fails() {
+        let err = expect_error("verbosity abc");
+        assert!(matches!(err.kind, ParseErrorKind::BadFormat));
+        assert_eq!(err.discard(), None);
+    }
+
+    #[test]
+    fn stats_with_no_args_parses_correctly() {
+        match expect_immediate("stats") {
+            Command::Stats => {}
+            other => panic!("expected Stats command, got {other:?}"),
         }
     }
 
     #[test]
     fn stats_with_subcommand_fails() {
-        let err = parse_command_line(&line("stats items")).unwrap_err();
+        let err = expect_error("stats cmd_get");
+
         assert!(matches!(err.kind, ParseErrorKind::BadFormat));
+        assert_eq!(err.discard(), None);
+    }
+
+    #[test]
+    fn quit_parses_correctly() {
+        match parse_command_line(&line("quit")).expect("should parse correctly") {
+            CommandHeader::Quit => {}
+            other => panic!("expected Quit, got {other:?}"),
+        }
     }
 }
