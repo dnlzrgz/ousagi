@@ -2,6 +2,7 @@ pub mod cli;
 pub mod clock;
 pub mod commands;
 pub mod connection;
+pub mod handler;
 pub mod parser;
 pub mod runtime;
 pub mod stats;
