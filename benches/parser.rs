@@ -136,13 +136,73 @@ fn bench_stats(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_get_and_touch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("parse_gat");
+
+    let gat = line("gat 100 foo");
+    group.throughput(Throughput::Bytes(gat.len() as u64));
+    group.bench_function("single_key", |b| {
+        b.iter(|| parse_command_line(black_box(&gat)))
+    });
+
+    let gats = line("gats 100 foo");
+    group.throughput(Throughput::Bytes(gats.len() as u64));
+    group.bench_function("single_key_with_cas", |b| {
+        b.iter(|| parse_command_line(black_box(&gats)))
+    });
+
+    group.finish();
+}
+
+fn bench_touch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("parse_touch");
+
+    let bytes = line("touch foo 100");
+    group.throughput(Throughput::Bytes(bytes.len() as u64));
+    group.bench_function("bare", |b| b.iter(|| parse_command_line(black_box(&bytes))));
+
+    group.finish();
+}
+
+fn bench_version(c: &mut Criterion) {
+    let mut group = c.benchmark_group("parse_version");
+
+    let bytes = line("version");
+    group.bench_function("bare", |b| b.iter(|| parse_command_line(black_box(&bytes))));
+
+    group.finish();
+}
+
+fn bench_verbosity(c: &mut Criterion) {
+    let mut group = c.benchmark_group("parse_verbosity");
+
+    let bytes = line("verbosity 1");
+    group.bench_function("bare", |b| b.iter(|| parse_command_line(black_box(&bytes))));
+
+    group.finish();
+}
+
+fn bench_quit(c: &mut Criterion) {
+    let mut group = c.benchmark_group("parse_quit");
+
+    let bytes = line("quit");
+    group.bench_function("bare", |b| b.iter(|| parse_command_line(black_box(&bytes))));
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_get,
+    bench_get_and_touch,
     bench_store,
     bench_delete,
     bench_arithmetic,
+    bench_touch,
     bench_flush_all,
+    bench_version,
+    bench_verbosity,
+    bench_quit,
     bench_stats,
 );
 

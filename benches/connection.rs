@@ -12,7 +12,7 @@ fn rt() -> Runtime {
     runtime::build(1)
 }
 
-/// Leaks `bytes` to get a `'static` slice. Runs some times at setup, not per-iteration.
+/// Leaks `bytes` to get a `'static` slice. Doesn't run per-iteration.
 fn leak(bytes: Vec<u8>) -> &'static [u8] {
     Box::leak(bytes.into_boxed_slice())
 }
@@ -178,4 +178,5 @@ criterion_group!(
     bench_read_command,
     bench_write_response,
 );
+
 criterion_main!(benches);

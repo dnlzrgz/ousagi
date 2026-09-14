@@ -42,5 +42,9 @@ name = "parser"
 harness = false
 
 [[bench]]
+name = "store"
+harness = false
+
+[[bench]]
 name = "connection"
 harness = false

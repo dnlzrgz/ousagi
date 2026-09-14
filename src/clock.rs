@@ -28,7 +28,6 @@ impl Clock {
         self.secs.store(secs, Ordering::Relaxed);
     }
 
-    #[cfg(test)]
     pub fn mock(start_secs: u64) -> SharedClock {
         Arc::new(Clock {
             secs: AtomicU64::new(start_secs),
