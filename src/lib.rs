@@ -1,9 +1,12 @@
 pub mod cli;
 pub mod clock;
 pub mod commands;
-pub mod connection;
+mod connection;
 pub mod handler;
 pub mod parser;
 pub mod runtime;
+pub mod server;
+pub mod session;
+pub mod shutdown;
 pub mod stats;
 pub mod store;

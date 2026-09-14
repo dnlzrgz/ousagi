@@ -1,16 +1,11 @@
 use std::io;
 
 use bytes::{Buf, Bytes, BytesMut};
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
-    net::TcpStream,
-};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
 
 use crate::{
     commands::{Command, Response},
-    handler,
     parser::{CommandHeader, parse_command_line},
-    store::Store,
 };
 
 const MAX_LINE_LEN: u64 = 8 * 1024; // bytes
@@ -263,19 +258,4 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
         self.buffer.reserve(4096);
         self.reader.read_buf(&mut self.buffer).await
     }
-}
-
-pub async fn process(mut socket: TcpStream, store: Store) -> io::Result<()> {
-    let (r, w) = socket.split();
-    let mut conn = Connection::new(r, w);
-
-    while let Some(cmd) = conn.read_command().await? {
-        let noreply = cmd.noreply();
-        let resp = handler::handle(cmd, &store);
-        if !noreply {
-            conn.write_response(&resp).await?;
-        }
-    }
-
-    Ok(())
 }
