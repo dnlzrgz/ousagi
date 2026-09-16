@@ -9,7 +9,7 @@ use dashmap::{DashMap, Entry};
 use crate::{
     clock::SharedClock,
     commands::{ArithmeticOp, Response, StoreArgs, StoreOp},
-    stats::Stats,
+    stats,
 };
 
 const THIRTY_DAYS_SECS: i64 = 60 * 60 * 24 * 30;
@@ -96,7 +96,6 @@ impl Item {
 
 struct StoreInner {
     items: DashMap<Bytes, Item>,
-    stats: Stats,
     next_cas: AtomicU64,
     oldest_live: AtomicU64,
     shared_clock: SharedClock,
@@ -111,7 +110,6 @@ impl StoreInner {
                 std::hash::RandomState::default(),
                 shard_amount,
             ),
-            stats: Stats::new(),
             next_cas: AtomicU64::new(1),
             oldest_live: AtomicU64::new(0),
             shared_clock,
@@ -153,7 +151,7 @@ impl Store {
 
     pub fn get(&self, keys: &[Bytes], with_cas: bool) -> Response {
         let now = self.inner.now();
-        Stats::incr(&self.inner.stats.cmd_get, keys.len() as u64);
+        stats::CMD_GET.add(keys.len());
 
         let oldest_live = self.inner.oldest_live();
         let mut expired_keys = Vec::with_capacity(6);
@@ -162,17 +160,17 @@ impl Store {
         for key in keys {
             match self.inner.items.get(key) {
                 Some(item) if item.is_expired(now, oldest_live) => {
-                    Stats::incr(&self.inner.stats.get_expired, 1);
-                    Stats::incr(&self.inner.stats.get_misses, 1);
+                    stats::GET_EXPIRED.add(1);
+                    stats::GET_MISSES.add(1);
                     expired_keys.push(key.clone());
                 }
                 Some(item) => {
-                    Stats::incr(&self.inner.stats.get_hits, 1);
+                    stats::GET_HITS.add(1);
                     let cas = with_cas.then(|| item.cas());
                     values.push((key.clone(), item.flags(), item.data().clone(), cas));
                 }
                 None => {
-                    Stats::incr(&self.inner.stats.get_misses, 1);
+                    stats::GET_MISSES.add(1);
                 }
             }
         }
@@ -190,7 +188,7 @@ impl Store {
 
     pub fn get_and_touch(&self, keys: &[Bytes], exptime: i64, with_cas: bool) -> Response {
         let now = self.inner.now();
-        Stats::incr(&self.inner.stats.cmd_get, keys.len() as u64);
+        stats::CMD_GET.add(keys.len());
 
         let oldest_live = self.inner.oldest_live();
         let mut expired_keys = Vec::with_capacity(6);
@@ -199,12 +197,12 @@ impl Store {
         for key in keys {
             match self.inner.items.entry(key.clone()) {
                 Entry::Occupied(entry) if entry.get().is_expired(now, oldest_live) => {
-                    Stats::incr(&self.inner.stats.get_expired, 1);
-                    Stats::incr(&self.inner.stats.get_misses, 1);
+                    stats::GET_EXPIRED.add(1);
+                    stats::GET_MISSES.add(1);
                     expired_keys.push(key.clone());
                 }
                 Entry::Occupied(mut entry) => {
-                    Stats::incr(&self.inner.stats.get_hits, 1);
+                    stats::GET_HITS.add(1);
 
                     let old_item = entry.get();
                     let cas = self.inner.next_cas();
@@ -224,7 +222,7 @@ impl Store {
                     values.push((key.clone(), flags, data, with_cas.then_some(cas)));
                 }
                 Entry::Vacant(_) => {
-                    Stats::incr(&self.inner.stats.get_misses, 1);
+                    stats::GET_MISSES.add(1);
                 }
             }
         }
@@ -242,7 +240,7 @@ impl Store {
 
     pub fn store(&self, op: StoreOp, args: StoreArgs) -> Response {
         let now = self.inner.now();
-        Stats::incr(&self.inner.stats.cmd_set, 1);
+        stats::CMD_SET.add(1);
 
         let oldest_live = self.inner.oldest_live();
         let cas = self.inner.next_cas();
@@ -251,7 +249,7 @@ impl Store {
             StoreOp::Set => {
                 let item = Item::new(args.data, args.flags, args.exptime, cas, now);
                 self.inner.items.insert(args.key, item);
-                Stats::incr(&self.inner.stats.total_items, 1);
+                stats::TOTAL_ITEMS.add(1);
                 Response::Stored
             }
             StoreOp::Add => match self.inner.items.entry(args.key) {
@@ -260,19 +258,19 @@ impl Store {
                 }
                 Entry::Occupied(mut entry) => {
                     entry.insert(Item::new(args.data, args.flags, args.exptime, cas, now));
-                    Stats::incr(&self.inner.stats.total_items, 1);
+                    stats::TOTAL_ITEMS.add(1);
                     Response::Stored
                 }
                 Entry::Vacant(entry) => {
                     entry.insert(Item::new(args.data, args.flags, args.exptime, cas, now));
-                    Stats::incr(&self.inner.stats.total_items, 1);
+                    stats::TOTAL_ITEMS.add(1);
                     Response::Stored
                 }
             },
             StoreOp::Replace => match self.inner.items.entry(args.key) {
                 Entry::Occupied(mut entry) if !entry.get().is_expired(now, oldest_live) => {
                     entry.insert(Item::new(args.data, args.flags, args.exptime, cas, now));
-                    Stats::incr(&self.inner.stats.total_items, 1);
+                    stats::TOTAL_ITEMS.add(1);
                     Response::Stored
                 }
                 _ => Response::NotStored,
@@ -301,7 +299,7 @@ impl Store {
                         old_item.stored_at(),
                     );
                     entry.insert(item);
-                    Stats::incr(&self.inner.stats.total_items, 1);
+                    stats::TOTAL_ITEMS.add(1);
                     Response::Stored
                 }
                 _ => Response::NotStored,
@@ -320,17 +318,17 @@ impl Store {
                             "cas mismatch"
                         );
 
-                        Stats::incr(&self.inner.stats.cas_badval, 1);
+                        stats::CAS_BADVAL.add(1);
                         return Response::Exists;
                     }
 
                     entry.insert(Item::new(args.data, args.flags, args.exptime, cas, now));
-                    Stats::incr(&self.inner.stats.cas_hits, 1);
-                    Stats::incr(&self.inner.stats.total_items, 1);
+                    stats::CAS_HITS.add(1);
+                    stats::TOTAL_ITEMS.add(1);
                     Response::Stored
                 }
                 _ => {
-                    Stats::incr(&self.inner.stats.cas_misses, 1);
+                    stats::CAS_MISSES.add(1);
                     Response::NotFound
                 }
             },
@@ -340,11 +338,11 @@ impl Store {
     pub fn delete(&self, key: &Bytes) -> Response {
         match self.inner.items.remove(key) {
             Some(_) => {
-                Stats::incr(&self.inner.stats.delete_hits, 1);
+                stats::DELETE_HITS.add(1);
                 Response::Deleted
             }
             None => {
-                Stats::incr(&self.inner.stats.delete_misses, 1);
+                stats::DELETE_MISSES.add(1);
                 Response::NotFound
             }
         }
@@ -352,10 +350,11 @@ impl Store {
 
     pub fn arithmetic(&self, op: ArithmeticOp, key: &Bytes, delta: u64) -> Response {
         let now = self.inner.now();
-        let (hits, misses) = match op {
-            ArithmeticOp::Incr => (&self.inner.stats.incr_hits, &self.inner.stats.incr_misses),
-            ArithmeticOp::Decr => (&self.inner.stats.decr_hits, &self.inner.stats.decr_misses),
+        let (cmd, hits, misses) = match op {
+            ArithmeticOp::Incr => (&stats::CMD_INCR, &stats::INCR_HITS, &stats::INCR_MISSES),
+            ArithmeticOp::Decr => (&stats::CMD_DECR, &stats::DECR_HITS, &stats::DECR_MISSES),
         };
+        cmd.add(1);
 
         let oldest_live = self.inner.oldest_live();
         let cas = self.inner.next_cas();
@@ -367,7 +366,7 @@ impl Store {
         match self.inner.items.entry(key.clone()) {
             Entry::Occupied(entry) if entry.get().is_expired(now, oldest_live) => {
                 entry.remove();
-                Stats::incr(misses, 1);
+                misses.add(1);
                 Response::NotFound
             }
             Entry::Occupied(mut entry) => {
@@ -398,11 +397,11 @@ impl Store {
                 );
 
                 entry.insert(new_item);
-                Stats::incr(hits, 1);
+                hits.add(1);
                 Response::Number(new_val)
             }
             Entry::Vacant(_) => {
-                Stats::incr(misses, 1);
+                misses.add(1);
                 Response::NotFound
             }
         }
@@ -439,8 +438,7 @@ impl Store {
 
     pub fn flush(&self, delay: Option<u32>) -> Response {
         tracing::info!(delay = ?delay, "flushing store");
-
-        Stats::incr(&self.inner.stats.cmd_flush, 1);
+        stats::CMD_FLUSH.add(1);
 
         match delay {
             Some(0) | None => {
@@ -454,8 +452,8 @@ impl Store {
         Response::Ok
     }
 
-    pub fn stats_report(&self) -> Response {
-        Response::Stats(self.inner.stats.report(self.inner.items.len()))
+    pub fn item_count(&self) -> usize {
+        self.inner.items.len()
     }
 }
 

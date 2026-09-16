@@ -1,84 +1,60 @@
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use contatori::counters::{Observable, unsigned::Unsigned};
 
-#[derive(Default, Debug)]
-pub struct Stats {
-    pub cmd_get: AtomicU64,
-    pub cmd_set: AtomicU64,
-    pub cmd_flush: AtomicU64,
+pub static CURR_CONNECTIONS: Unsigned = Unsigned::new();
+pub static TOTAL_CONNECTIONS: Unsigned = Unsigned::new();
+pub static CMD_GET: Unsigned = Unsigned::new();
+pub static CMD_SET: Unsigned = Unsigned::new();
+pub static CMD_FLUSH: Unsigned = Unsigned::new();
+pub static GET_HITS: Unsigned = Unsigned::new();
+pub static GET_MISSES: Unsigned = Unsigned::new();
+pub static GET_EXPIRED: Unsigned = Unsigned::new();
+pub static DELETE_HITS: Unsigned = Unsigned::new();
+pub static DELETE_MISSES: Unsigned = Unsigned::new();
+pub static CMD_INCR: Unsigned = Unsigned::new();
+pub static CMD_DECR: Unsigned = Unsigned::new();
+pub static INCR_HITS: Unsigned = Unsigned::new();
+pub static INCR_MISSES: Unsigned = Unsigned::new();
+pub static DECR_HITS: Unsigned = Unsigned::new();
+pub static DECR_MISSES: Unsigned = Unsigned::new();
+pub static CAS_HITS: Unsigned = Unsigned::new();
+pub static CAS_MISSES: Unsigned = Unsigned::new();
+pub static CAS_BADVAL: Unsigned = Unsigned::new();
+pub static TOTAL_ITEMS: Unsigned = Unsigned::new();
+pub static EVICTIONS: Unsigned = Unsigned::new();
+pub static BYTES_READ: Unsigned = Unsigned::new();
+pub static BYTES_WRITTEN: Unsigned = Unsigned::new();
 
-    pub get_hits: AtomicU64,
-    pub get_misses: AtomicU64,
-    pub get_expired: AtomicU64,
-
-    pub cas_hits: AtomicU64,
-    pub cas_misses: AtomicU64,
-    pub cas_badval: AtomicU64,
-
-    pub delete_hits: AtomicU64,
-    pub delete_misses: AtomicU64,
-
-    pub incr_hits: AtomicU64,
-    pub incr_misses: AtomicU64,
-    pub decr_hits: AtomicU64,
-    pub decr_misses: AtomicU64,
-
-    pub curr_items: AtomicU64,
-    pub total_items: AtomicU64,
-    pub evictions: AtomicU64,
-
-    pub bytes_read: AtomicU64,
-    pub bytes_written: AtomicU64,
-
-    pub curr_connections: AtomicU64,
-    pub total_connections: AtomicU64,
-}
-
-impl Stats {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    #[inline]
-    pub fn incr(counter: &AtomicU64, n: u64) {
-        counter.fetch_add(n, Relaxed);
-    }
-
-    pub fn report(&self, curr_items: usize) -> Vec<(&'static str, String)> {
-        vec![
-            (
-                "curr_connections",
-                self.curr_connections.load(Relaxed).to_string(),
-            ),
-            (
-                "total_connections",
-                self.total_connections.load(Relaxed).to_string(),
-            ),
-            ("cmd_get", self.cmd_get.load(Relaxed).to_string()),
-            ("cmd_set", self.cmd_set.load(Relaxed).to_string()),
-            ("cmd_flush", self.cmd_flush.load(Relaxed).to_string()),
-            ("get_hits", self.get_hits.load(Relaxed).to_string()),
-            ("get_misses", self.get_misses.load(Relaxed).to_string()),
-            ("get_expired", self.get_expired.load(Relaxed).to_string()),
-            ("delete_hits", self.delete_hits.load(Relaxed).to_string()),
-            (
-                "delete_misses",
-                self.delete_misses.load(Relaxed).to_string(),
-            ),
-            ("incr_hits", self.incr_hits.load(Relaxed).to_string()),
-            ("incr_misses", self.incr_misses.load(Relaxed).to_string()),
-            ("decr_hits", self.decr_hits.load(Relaxed).to_string()),
-            ("decr_misses", self.decr_misses.load(Relaxed).to_string()),
-            ("cas_hits", self.cas_hits.load(Relaxed).to_string()),
-            ("cas_misses", self.cas_misses.load(Relaxed).to_string()),
-            ("cas_badval", self.cas_badval.load(Relaxed).to_string()),
-            ("curr_items", curr_items.to_string()),
-            ("total_items", self.total_items.load(Relaxed).to_string()),
-            ("evictions", self.evictions.load(Relaxed).to_string()),
-            ("bytes_read", self.bytes_read.load(Relaxed).to_string()),
-            (
-                "bytes_written",
-                self.bytes_written.load(Relaxed).to_string(),
-            ),
-        ]
-    }
+pub fn report(curr_items: usize) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "curr_connections",
+            CURR_CONNECTIONS.value().as_u64().to_string(),
+        ),
+        (
+            "total_connections",
+            TOTAL_CONNECTIONS.value().as_u64().to_string(),
+        ),
+        ("cmd_get", CMD_GET.value().as_u64().to_string()),
+        ("cmd_set", CMD_SET.value().as_u64().to_string()),
+        ("cmd_flush", CMD_FLUSH.value().as_u64().to_string()),
+        ("get_hits", GET_HITS.value().as_u64().to_string()),
+        ("get_misses", GET_MISSES.value().as_u64().to_string()),
+        ("get_expired", GET_EXPIRED.value().as_u64().to_string()),
+        ("delete_hits", DELETE_HITS.value().as_u64().to_string()),
+        ("delete_misses", DELETE_MISSES.value().as_u64().to_string()),
+        ("cmd_incr", CMD_INCR.value().as_u64().to_string()),
+        ("cmd_decr", CMD_DECR.value().as_u64().to_string()),
+        ("incr_hits", INCR_HITS.value().as_u64().to_string()),
+        ("incr_misses", INCR_MISSES.value().as_u64().to_string()),
+        ("decr_hits", DECR_HITS.value().as_u64().to_string()),
+        ("decr_misses", DECR_MISSES.value().as_u64().to_string()),
+        ("cas_hits", CAS_HITS.value().as_u64().to_string()),
+        ("cas_misses", CAS_MISSES.value().as_u64().to_string()),
+        ("cas_badval", CAS_BADVAL.value().as_u64().to_string()),
+        ("curr_items", curr_items.to_string()),
+        ("total_items", TOTAL_ITEMS.value().as_u64().to_string()),
+        ("evictions", EVICTIONS.value().as_u64().to_string()),
+        ("bytes_read", BYTES_READ.value().as_u64().to_string()),
+        ("bytes_written", BYTES_WRITTEN.value().as_u64().to_string()),
+    ]
 }

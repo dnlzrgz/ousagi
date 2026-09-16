@@ -2,6 +2,7 @@ use tracing::{Level, instrument};
 
 use crate::{
     commands::{Command, Response},
+    stats,
     store::Store,
 };
 
@@ -23,6 +24,6 @@ pub fn handle(cmd: Command, store: &Store) -> Response {
         Command::FlushAll { delay, .. } => store.flush(delay),
         Command::Version => Response::Version(VERSION),
         Command::Verbosity { .. } => Response::Ok,
-        Command::Stats => store.stats_report(),
+        Command::Stats => Response::Stats(stats::report(store.item_count())),
     }
 }
