@@ -2,7 +2,9 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use tokio::{net::TcpListener, sync::Semaphore};
 
-use crate::{cli::Cli, clock::spawn_clock, session, shutdown::shutdown_signal, store::Store};
+use crate::{
+    cli::Cli, clock::spawn_clock, session, shutdown::shutdown_signal, stats, store::Store,
+};
 
 fn resolve_addr(args: &Cli) -> SocketAddr {
     let ip = args.listen.as_deref().unwrap_or("0.0.0.0");
@@ -50,10 +52,16 @@ async fn accept_loop(listener: TcpListener, store: Store, connections: Arc<Semap
         }
 
         tracing::info!(%addr, "connection accepted");
+        stats::TOTAL_CONNECTIONS.add(1);
+        stats::CURR_CONNECTIONS.add(1);
+
         let store = store.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            match session::process(socket, store).await {
+            let res = session::process(socket, store).await;
+            stats::CURR_CONNECTIONS.sub(1);
+
+            match res {
                 Ok(()) => tracing::info!(%addr, "connection closed"),
                 Err(e) => tracing::warn!(%addr, error = %e, "connection error"),
             }

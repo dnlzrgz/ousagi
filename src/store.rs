@@ -412,9 +412,12 @@ impl Store {
         let oldest_live = self.inner.oldest_live();
         let cas = self.inner.next_cas();
 
+        stats::CMD_TOUCH.add(1);
+
         match self.inner.items.entry(key.clone()) {
             Entry::Occupied(entry) if entry.get().is_expired(now, oldest_live) => {
                 entry.remove();
+                stats::TOUCH_MISSES.add(1);
                 Response::NotFound
             }
             Entry::Occupied(mut entry) => {
@@ -430,9 +433,13 @@ impl Store {
                 );
 
                 entry.insert(touched);
+                stats::TOUCH_HITS.add(1);
                 Response::Touched
             }
-            _ => Response::NotFound,
+            _ => {
+                stats::TOUCH_HITS.add(1);
+                Response::NotFound
+            }
         }
     }
 
