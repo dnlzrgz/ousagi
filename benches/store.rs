@@ -6,10 +6,8 @@ use ousagi::clock::Clock;
 use ousagi::commands::{ArithmeticOp, Response, StoreArgs, StoreOp};
 use ousagi::store::Store;
 
-const THREADS: usize = 4;
-
 fn empty_store() -> Store {
-    Store::new(Clock::mock(1_000_000), THREADS)
+    Store::new(Clock::mock(1_000_000), 1024 * 1024)
 }
 
 fn populated_store(key: &str, data: &[u8]) -> Store {

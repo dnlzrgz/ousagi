@@ -4,7 +4,10 @@ use std::sync::{
 };
 
 use bytes::{Bytes, BytesMut};
-use dashmap::{DashMap, Entry};
+use quick_cache::{
+    DefaultHashBuilder, Lifecycle, OptionsBuilder, Weighter,
+    sync::{Cache, EntryAction, EntryResult},
+};
 
 use crate::{
     clock::SharedClock,
@@ -14,7 +17,7 @@ use crate::{
 
 const THIRTY_DAYS_SECS: i64 = 60 * 60 * 24 * 30;
 
-/// A value stored in the cache.
+#[derive(Clone)]
 pub struct Item {
     data: Bytes,
     flags: u32,
@@ -40,22 +43,6 @@ impl Item {
             expires_at: Self::resolve_expiry(exptime, now),
             cas,
             stored_at: now,
-        }
-    }
-
-    pub(crate) fn with_parts(
-        data: Bytes,
-        flags: u32,
-        expires_at: Option<u64>,
-        cas: u64,
-        stored_at: u64,
-    ) -> Self {
-        Self {
-            data,
-            flags,
-            expires_at,
-            cas,
-            stored_at,
         }
     }
 
@@ -94,22 +81,49 @@ impl Item {
     }
 }
 
+#[derive(Clone)]
+struct ItemWeighter;
+
+impl Weighter<Bytes, Item> for ItemWeighter {
+    fn weight(&self, key: &Bytes, item: &Item) -> u64 {
+        const OVERHEAD: usize = 64;
+        (key.len() + item.data().len() + OVERHEAD) as u64
+    }
+}
+
+#[derive(Clone)]
+struct ItemLifecycle;
+
+impl Lifecycle<Bytes, Item> for ItemLifecycle {
+    type RequestState = ();
+
+    fn on_evict(&self, _state: &mut Self::RequestState, _key: Bytes, _item: Item) {
+        stats::EVICTIONS.add(1);
+    }
+}
+
 struct StoreInner {
-    items: DashMap<Bytes, Item>,
+    items: Cache<Bytes, Item, ItemWeighter, DefaultHashBuilder, ItemLifecycle>,
     next_cas: AtomicU64,
     oldest_live: AtomicU64,
     shared_clock: SharedClock,
 }
 
 impl StoreInner {
-    pub fn new(shared_clock: SharedClock, threads: usize) -> Self {
-        let shard_amount = (threads.max(1) * 4).next_power_of_two();
+    pub fn new(shared_clock: SharedClock, memory_limit_bytes: u64) -> Self {
+        let items = Cache::with_options(
+            OptionsBuilder::new()
+                .weight_capacity(memory_limit_bytes)
+                .estimated_items_capacity(1000)
+                .build()
+                .unwrap(),
+            ItemWeighter,
+            DefaultHashBuilder::default(),
+            ItemLifecycle,
+        );
 
         Self {
-            items: DashMap::with_hasher_and_shard_amount(
-                std::hash::RandomState::default(),
-                shard_amount,
-            ),
+            items,
             next_cas: AtomicU64::new(1),
             oldest_live: AtomicU64::new(0),
             shared_clock,
@@ -143,9 +157,9 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn new(shared_clock: SharedClock, threads: usize) -> Self {
+    pub fn new(shared_clock: SharedClock, memory_limit_bytes: u64) -> Self {
         Self {
-            inner: Arc::new(StoreInner::new(shared_clock, threads)),
+            inner: Arc::new(StoreInner::new(shared_clock, memory_limit_bytes)),
         }
     }
 
@@ -154,32 +168,31 @@ impl Store {
         stats::CMD_GET.add(keys.len());
 
         let oldest_live = self.inner.oldest_live();
-        let mut expired_keys = Vec::with_capacity(6);
         let mut values = Vec::with_capacity(keys.len());
 
         for key in keys {
-            match self.inner.items.get(key) {
-                Some(item) if item.is_expired(now, oldest_live) => {
+            let result = self.inner.items.entry(key, None, |_key, item| {
+                if item.is_expired(now, oldest_live) {
+                    EntryAction::Remove
+                } else {
+                    EntryAction::Retain((item.flags(), item.data().clone(), item.cas()))
+                }
+            });
+
+            match result {
+                EntryResult::Retained((flags, data, cas)) => {
+                    stats::GET_HITS.add(1);
+                    let cas = with_cas.then_some(cas);
+                    values.push((key.clone(), flags, data, cas));
+                }
+                EntryResult::Removed(..) => {
                     stats::GET_EXPIRED.add(1);
                     stats::GET_MISSES.add(1);
-                    expired_keys.push(key.clone());
                 }
-                Some(item) => {
-                    stats::GET_HITS.add(1);
-                    let cas = with_cas.then(|| item.cas());
-                    values.push((key.clone(), item.flags(), item.data().clone(), cas));
-                }
-                None => {
+                EntryResult::Vacant(_) => {
                     stats::GET_MISSES.add(1);
                 }
-            }
-        }
-
-        for key in expired_keys {
-            if let Entry::Occupied(entry) = self.inner.items.entry(key)
-                && entry.get().is_expired(now, oldest_live)
-            {
-                entry.remove();
+                _ => unreachable!(),
             }
         }
 
@@ -191,47 +204,33 @@ impl Store {
         stats::CMD_GET.add(keys.len());
 
         let oldest_live = self.inner.oldest_live();
-        let mut expired_keys = Vec::with_capacity(6);
         let mut values = Vec::with_capacity(keys.len());
 
         for key in keys {
-            match self.inner.items.entry(key.clone()) {
-                Entry::Occupied(entry) if entry.get().is_expired(now, oldest_live) => {
-                    stats::GET_EXPIRED.add(1);
-                    stats::GET_MISSES.add(1);
-                    expired_keys.push(key.clone());
+            let result = self.inner.items.entry(key, None, |_key, item| {
+                if item.is_expired(now, oldest_live) {
+                    return EntryAction::Remove;
                 }
-                Entry::Occupied(mut entry) => {
+
+                item.expires_at = Item::resolve_expiry(exptime, now);
+                item.cas = self.inner.next_cas();
+
+                EntryAction::Retain((item.flags(), item.data().clone(), item.cas))
+            });
+
+            match result {
+                EntryResult::Retained((flags, data, cas)) => {
                     stats::GET_HITS.add(1);
-
-                    let old_item = entry.get();
-                    let cas = self.inner.next_cas();
-                    let expires_at = Item::resolve_expiry(exptime, now);
-                    let touched = Item::with_parts(
-                        old_item.data().clone(),
-                        old_item.flags(),
-                        expires_at,
-                        cas,
-                        old_item.stored_at(),
-                    );
-
-                    let flags = touched.flags();
-                    let data = touched.data().clone();
-                    entry.insert(touched);
-
                     values.push((key.clone(), flags, data, with_cas.then_some(cas)));
                 }
-                Entry::Vacant(_) => {
+                EntryResult::Removed(..) => {
+                    stats::GET_EXPIRED.add(1);
                     stats::GET_MISSES.add(1);
                 }
-            }
-        }
-
-        for key in expired_keys {
-            if let Entry::Occupied(entry) = self.inner.items.entry(key)
-                && entry.get().is_expired(now, oldest_live)
-            {
-                entry.remove();
+                EntryResult::Vacant(_) => {
+                    stats::GET_MISSES.add(1);
+                }
+                _ => unreachable!(),
             }
         }
 
@@ -252,91 +251,134 @@ impl Store {
                 stats::TOTAL_ITEMS.add(1);
                 Response::Stored
             }
-            StoreOp::Add => match self.inner.items.entry(args.key) {
-                Entry::Occupied(entry) if !entry.get().is_expired(now, oldest_live) => {
-                    Response::NotStored
-                }
-                Entry::Occupied(mut entry) => {
-                    entry.insert(Item::new(args.data, args.flags, args.exptime, cas, now));
-                    stats::TOTAL_ITEMS.add(1);
-                    Response::Stored
-                }
-                Entry::Vacant(entry) => {
-                    entry.insert(Item::new(args.data, args.flags, args.exptime, cas, now));
-                    stats::TOTAL_ITEMS.add(1);
-                    Response::Stored
-                }
-            },
-            StoreOp::Replace => match self.inner.items.entry(args.key) {
-                Entry::Occupied(mut entry) if !entry.get().is_expired(now, oldest_live) => {
-                    entry.insert(Item::new(args.data, args.flags, args.exptime, cas, now));
-                    stats::TOTAL_ITEMS.add(1);
-                    Response::Stored
-                }
-                _ => Response::NotStored,
-            },
-            StoreOp::Append | StoreOp::Prepend => match self.inner.items.entry(args.key) {
-                Entry::Occupied(mut entry) if !entry.get().is_expired(now, oldest_live) => {
-                    let old_item = entry.get();
-
-                    let mut new_data =
-                        BytesMut::with_capacity(old_item.data().len() + args.data.len());
-
-                    let (first, second) = if op == StoreOp::Append {
-                        (old_item.data(), &args.data)
+            StoreOp::Add => {
+                let result = self.inner.items.entry(&args.key, None, |_k, item| {
+                    if item.is_expired(now, oldest_live) {
+                        *item = Item::new(args.data.clone(), args.flags, args.exptime, cas, now);
+                        EntryAction::Retain(true)
                     } else {
-                        (&args.data, old_item.data())
-                    };
-                    new_data.extend_from_slice(first);
-                    new_data.extend_from_slice(second);
-                    let new_data = new_data.freeze();
+                        EntryAction::Retain(false)
+                    }
+                });
 
-                    let item = Item::with_parts(
-                        new_data,
-                        old_item.flags(),
-                        old_item.expires_at(),
-                        cas,
-                        old_item.stored_at(),
-                    );
-                    entry.insert(item);
-                    stats::TOTAL_ITEMS.add(1);
-                    Response::Stored
+                match result {
+                    EntryResult::Retained(true) => {
+                        stats::TOTAL_ITEMS.add(1);
+                        Response::Stored
+                    }
+                    EntryResult::Retained(false) => Response::NotStored,
+                    EntryResult::Vacant(guard) => {
+                        let item = Item::new(args.data, args.flags, args.exptime, cas, now);
+                        if guard.insert(item).is_ok() {
+                            stats::TOTAL_ITEMS.add(1);
+                            Response::Stored
+                        } else {
+                            Response::NotStored
+                        }
+                    }
+                    _ => Response::NotStored,
                 }
-                _ => Response::NotStored,
-            },
-            StoreOp::Cas => match self.inner.items.entry(args.key) {
-                Entry::Occupied(mut entry) if !entry.get().is_expired(now, oldest_live) => {
-                    let Some(expected_cas) = args.cas else {
-                        tracing::warn!("received cas command without a cas token");
-                        return Response::ServerError("missing cas value");
-                    };
+            }
+            StoreOp::Replace => {
+                let result = self.inner.items.entry(&args.key, None, |_k, item| {
+                    if item.is_expired(now, oldest_live) {
+                        EntryAction::Remove
+                    } else {
+                        *item = Item::new(args.data.clone(), args.flags, args.exptime, cas, now);
+                        EntryAction::Retain(())
+                    }
+                });
 
-                    if entry.get().cas() != expected_cas {
-                        tracing::debug!(
-                            expected = expected_cas,
-                            actual = entry.get().cas(),
-                            "cas mismatch"
-                        );
+                match result {
+                    EntryResult::Retained(()) => {
+                        stats::TOTAL_ITEMS.add(1);
+                        Response::Stored
+                    }
+                    _ => Response::NotStored,
+                }
+            }
+            StoreOp::Append | StoreOp::Prepend => {
+                let is_append = op == StoreOp::Append;
 
-                        stats::CAS_BADVAL.add(1);
-                        return Response::Exists;
+                let result = self.inner.items.entry(&args.key, None, |_k, item| {
+                    if item.is_expired(now, oldest_live) {
+                        return EntryAction::Remove;
                     }
 
-                    entry.insert(Item::new(args.data, args.flags, args.exptime, cas, now));
-                    stats::CAS_HITS.add(1);
-                    stats::TOTAL_ITEMS.add(1);
-                    Response::Stored
+                    let mut new_data = BytesMut::with_capacity(item.data.len() + args.data.len());
+                    let (first, second) = if is_append {
+                        (item.data.as_ref(), args.data.as_ref())
+                    } else {
+                        (args.data.as_ref(), item.data.as_ref())
+                    };
+
+                    new_data.extend_from_slice(first);
+                    new_data.extend_from_slice(second);
+
+                    item.data = new_data.freeze();
+                    item.cas = cas;
+                    EntryAction::Retain(())
+                });
+
+                match result {
+                    EntryResult::Retained(()) => {
+                        stats::TOTAL_ITEMS.add(1);
+                        Response::Stored
+                    }
+                    _ => Response::NotStored,
                 }
-                _ => {
-                    stats::CAS_MISSES.add(1);
-                    Response::NotFound
+            }
+
+            StoreOp::Cas => {
+                let Some(expected_cas) = args.cas else {
+                    tracing::warn!("received cas command without a cas token");
+                    return Response::ServerError("missing cas value");
+                };
+
+                let result = self.inner.items.entry(&args.key, None, |_k, item| {
+                    if item.is_expired(now, oldest_live) {
+                        return EntryAction::Remove;
+                    }
+
+                    if item.cas != expected_cas {
+                        tracing::debug!(expected = expected_cas, actual = item.cas, "cas mismatch");
+                        return EntryAction::Retain(false);
+                    }
+
+                    *item = Item::new(args.data.clone(), args.flags, args.exptime, cas, now);
+                    EntryAction::Retain(true)
+                });
+
+                match result {
+                    EntryResult::Retained(true) => {
+                        stats::CAS_HITS.add(1);
+                        stats::TOTAL_ITEMS.add(1);
+                        Response::Stored
+                    }
+                    EntryResult::Retained(false) => {
+                        stats::CAS_BADVAL.add(1);
+                        Response::Exists
+                    }
+                    EntryResult::Removed(..) | EntryResult::Vacant(_) => {
+                        stats::CAS_MISSES.add(1);
+                        Response::NotFound
+                    }
+                    _ => Response::NotFound,
                 }
-            },
+            }
         }
     }
 
     pub fn delete(&self, key: &Bytes) -> Response {
+        let now = self.inner.now();
+        let oldest_live = self.inner.oldest_live();
+
         match self.inner.items.remove(key) {
+            Some((_, item)) if item.is_expired(now, oldest_live) => {
+                stats::GET_EXPIRED.add(1);
+                stats::DELETE_MISSES.add(1);
+                Response::NotFound
+            }
             Some(_) => {
                 stats::DELETE_HITS.add(1);
                 Response::Deleted
@@ -363,44 +405,43 @@ impl Store {
             ArithmeticOp::Decr => "cannot decrement non-numeric value",
         };
 
-        match self.inner.items.entry(key.clone()) {
-            Entry::Occupied(entry) if entry.get().is_expired(now, oldest_live) => {
-                entry.remove();
-                misses.add(1);
-                Response::NotFound
+        let result = self.inner.items.entry(key, None, |_k, item| {
+            if item.is_expired(now, oldest_live) {
+                return EntryAction::Remove;
             }
-            Entry::Occupied(mut entry) => {
-                let old_item = entry.get();
 
-                let Ok(s) = std::str::from_utf8(old_item.data()) else {
-                    tracing::debug!(key = ?key, "arithmetic operation failed: non-utf8 content");
-                    return Response::ClientError(error);
-                };
+            let Ok(s) = std::str::from_utf8(item.data.as_ref()) else {
+                tracing::debug!(key = ?key, "arithmetic operation failed: non-utf8 content");
+                return EntryAction::Retain(Err(error));
+            };
 
-                let Ok(val) = s.trim().parse::<u64>() else {
-                    tracing::debug!(key = ?key, "arithmetic operation failed: non-utf8 content");
-                    return Response::ClientError(error);
-                };
+            let Ok(val) = s.trim().parse::<u64>() else {
+                tracing::debug!(key = ?key, "arithmetic operation failed: non-numeric content");
+                return EntryAction::Retain(Err(error));
+            };
 
-                let new_val = match op {
-                    ArithmeticOp::Incr => val.wrapping_add(delta),
-                    ArithmeticOp::Decr => val.saturating_sub(delta),
-                };
-                let new_data = Bytes::from(new_val.to_string());
+            let new_val = match op {
+                ArithmeticOp::Incr => val.wrapping_add(delta),
+                ArithmeticOp::Decr => val.saturating_sub(delta),
+            };
 
-                let new_item = Item::with_parts(
-                    new_data,
-                    old_item.flags(),
-                    old_item.expires_at(),
-                    cas,
-                    old_item.stored_at(),
-                );
+            item.data = Bytes::from(new_val.to_string());
+            item.cas = cas;
 
-                entry.insert(new_item);
+            EntryAction::Retain(Ok(new_val))
+        });
+
+        match result {
+            EntryResult::Retained(Ok(new_val)) => {
                 hits.add(1);
                 Response::Number(new_val)
             }
-            Entry::Vacant(_) => {
+            EntryResult::Retained(Err(msg)) => Response::ClientError(msg),
+            EntryResult::Removed(..) | EntryResult::Vacant(_) => {
+                misses.add(1);
+                Response::NotFound
+            }
+            _ => {
                 misses.add(1);
                 Response::NotFound
             }
@@ -414,30 +455,28 @@ impl Store {
 
         stats::CMD_TOUCH.add(1);
 
-        match self.inner.items.entry(key.clone()) {
-            Entry::Occupied(entry) if entry.get().is_expired(now, oldest_live) => {
-                entry.remove();
-                stats::TOUCH_MISSES.add(1);
-                Response::NotFound
+        let result = self.inner.items.entry(key, None, |_k, item| {
+            if item.is_expired(now, oldest_live) {
+                return EntryAction::Remove;
             }
-            Entry::Occupied(mut entry) => {
-                let old_item = entry.get();
 
-                let expires_at = Item::resolve_expiry(exptime, now);
-                let touched = Item::with_parts(
-                    old_item.data().clone(),
-                    old_item.flags(),
-                    expires_at,
-                    cas,
-                    old_item.stored_at(),
-                );
+            item.expires_at = Item::resolve_expiry(exptime, now);
+            item.cas = cas;
 
-                entry.insert(touched);
+            EntryAction::Retain(())
+        });
+
+        match result {
+            EntryResult::Retained(()) => {
                 stats::TOUCH_HITS.add(1);
                 Response::Touched
             }
+            EntryResult::Removed(..) | EntryResult::Vacant(_) => {
+                stats::TOUCH_MISSES.add(1);
+                Response::NotFound
+            }
             _ => {
-                stats::TOUCH_HITS.add(1);
+                stats::TOUCH_MISSES.add(1);
                 Response::NotFound
             }
         }
@@ -470,7 +509,7 @@ mod tests {
     use crate::clock::Clock;
 
     const TEST_NOW: u64 = 1_000_000;
-    const TEST_THREADS: usize = 1;
+    const TEST_MEMORY_LIMIT: u64 = 1024 * 1024;
 
     fn item_at(secs_from_now: i64, now: u64) -> Item {
         Item::new(Bytes::from_static(b"data"), 0, secs_from_now, 1, now)
@@ -478,7 +517,7 @@ mod tests {
 
     /// Empty Store with a mock clock
     fn empty_store() -> Store {
-        Store::new(Clock::mock(TEST_NOW), TEST_THREADS)
+        Store::new(Clock::mock(TEST_NOW), TEST_MEMORY_LIMIT)
     }
 
     /// Pre-populated Store with one item
@@ -493,7 +532,7 @@ mod tests {
 
     fn store_with_clock(key: &str, item: Item) -> (Store, SharedClock) {
         let clock = Clock::mock(TEST_NOW);
-        let store = Store::new(clock.clone(), TEST_THREADS);
+        let store = Store::new(clock.clone(), TEST_MEMORY_LIMIT);
         store
             .inner
             .items
@@ -581,7 +620,7 @@ mod tests {
     #[test]
     fn next_cas_starts_at_one_and_increments() {
         let clock = Clock::mock(1_000);
-        let store = Store::new(clock, 4);
+        let store = Store::new(clock, TEST_MEMORY_LIMIT);
 
         assert_eq!(store.inner.next_cas(), 1);
         assert_eq!(store.inner.next_cas(), 2);
@@ -590,7 +629,7 @@ mod tests {
     #[test]
     fn oldest_live_defaults_to_none() {
         let clock = Clock::mock(1_000);
-        let store = Store::new(clock, 4);
+        let store = Store::new(clock, TEST_MEMORY_LIMIT);
 
         assert_eq!(store.inner.oldest_live(), None);
     }
@@ -816,9 +855,7 @@ mod tests {
         let resp = store.store(StoreOp::Replace, store_args("foo", 50, 0, b"jello", None));
 
         assert!(matches!(resp, Response::NotStored));
-
-        let item = store.inner.items.get("foo".as_bytes()).unwrap();
-        assert_eq!(item.data().as_ref(), b"hello");
+        assert!(store.inner.items.get("foo".as_bytes()).is_none());
     }
 
     #[test]
@@ -862,9 +899,7 @@ mod tests {
         let resp = store.store(StoreOp::Append, store_args("foo", 0, 0, b" world", None));
 
         assert!(matches!(resp, Response::NotStored));
-
-        let item = store.inner.items.get("foo".as_bytes()).unwrap();
-        assert_eq!(item.data().as_ref(), b"hello"); // untouched
+        assert!(store.inner.items.get("foo".as_bytes()).is_none());
     }
 
     #[test]
@@ -906,9 +941,7 @@ mod tests {
         let resp = store.store(StoreOp::Cas, store_args("foo", 42, 0, b"jello", Some(7)));
 
         assert!(matches!(resp, Response::NotFound));
-
-        let item = store.inner.items.get("foo".as_bytes()).unwrap();
-        assert_eq!(item.data().as_ref(), b"hello");
+        assert!(store.inner.items.get("foo".as_bytes()).is_none());
     }
 
     #[test]
@@ -1102,7 +1135,7 @@ mod tests {
     #[test]
     fn flush_all_sets_oldest_live() {
         let clock = Clock::mock(1_000);
-        let store = Store::new(clock, 4);
+        let store = Store::new(clock, TEST_MEMORY_LIMIT);
 
         store.flush(Some(30));
 

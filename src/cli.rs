@@ -18,6 +18,10 @@ pub struct Cli {
     #[arg(short = 'c', long, default_value_t = 1024)]
     pub max_connections: usize,
 
+    /// Max memory to use for cached items, in megabytes
+    #[arg(short = 'm', long, default_value_t = 64)]
+    pub memory_limit_mb: u64,
+
     /// Verbosity level (-v, -vv, -vvv)
     #[arg(short = 'v', long="verbose", action = ArgAction::Count)]
     pub verbose: u8,
