@@ -238,134 +238,172 @@ impl Store {
     }
 
     pub fn store(&self, op: StoreOp, args: StoreArgs) -> Response {
-        let now = self.inner.now();
         stats::CMD_SET.add(1);
 
+        match op {
+            StoreOp::Set => self.store_set(args),
+            StoreOp::Add => self.store_add(args),
+            StoreOp::Replace => self.store_replace(args),
+            StoreOp::Append | StoreOp::Prepend => self.store_append_or_prepend(op, args),
+            StoreOp::Cas => self.store_cas(args),
+        }
+    }
+
+    fn store_set(&self, args: StoreArgs) -> Response {
+        let now = self.inner.now();
+        let cas = self.inner.next_cas();
+
+        let item = Item::new(args.data, args.flags, args.exptime, cas, now);
+        self.inner.items.insert(args.key, item);
+        stats::TOTAL_ITEMS.add(1);
+        Response::Stored
+    }
+
+    fn store_add(&self, args: StoreArgs) -> Response {
+        let now = self.inner.now();
         let oldest_live = self.inner.oldest_live();
         let cas = self.inner.next_cas();
 
-        match op {
-            StoreOp::Set => {
-                let item = Item::new(args.data, args.flags, args.exptime, cas, now);
-                self.inner.items.insert(args.key, item);
+        let result = self.inner.items.entry(&args.key, None, |_k, item| {
+            if item.is_expired(now, oldest_live) {
+                *item = Item::new(args.data.clone(), args.flags, args.exptime, cas, now);
+                EntryAction::Retain(true)
+            } else {
+                EntryAction::Retain(false)
+            }
+        });
+
+        match result {
+            EntryResult::Retained(true) => {
                 stats::TOTAL_ITEMS.add(1);
                 Response::Stored
             }
-            StoreOp::Add => {
-                let result = self.inner.items.entry(&args.key, None, |_k, item| {
-                    if item.is_expired(now, oldest_live) {
-                        *item = Item::new(args.data.clone(), args.flags, args.exptime, cas, now);
-                        EntryAction::Retain(true)
-                    } else {
-                        EntryAction::Retain(false)
-                    }
-                });
-
-                match result {
-                    EntryResult::Retained(true) => {
-                        stats::TOTAL_ITEMS.add(1);
-                        Response::Stored
-                    }
-                    EntryResult::Retained(false) => Response::NotStored,
-                    EntryResult::Vacant(guard) => {
-                        let item = Item::new(args.data, args.flags, args.exptime, cas, now);
-                        if guard.insert(item).is_ok() {
-                            stats::TOTAL_ITEMS.add(1);
-                            Response::Stored
-                        } else {
-                            Response::NotStored
-                        }
-                    }
-                    _ => Response::NotStored,
+            EntryResult::Retained(false) => Response::NotStored,
+            EntryResult::Vacant(guard) => {
+                let item = Item::new(args.data, args.flags, args.exptime, cas, now);
+                if guard.insert(item).is_ok() {
+                    stats::TOTAL_ITEMS.add(1);
+                    Response::Stored
+                } else {
+                    Response::NotStored
                 }
             }
-            StoreOp::Replace => {
-                let result = self.inner.items.entry(&args.key, None, |_k, item| {
-                    if item.is_expired(now, oldest_live) {
-                        EntryAction::Remove
-                    } else {
-                        *item = Item::new(args.data.clone(), args.flags, args.exptime, cas, now);
-                        EntryAction::Retain(())
-                    }
-                });
+            _ => unreachable!(),
+        }
+    }
 
-                match result {
-                    EntryResult::Retained(()) => {
-                        stats::TOTAL_ITEMS.add(1);
-                        Response::Stored
-                    }
-                    _ => Response::NotStored,
-                }
+    fn store_replace(&self, args: StoreArgs) -> Response {
+        let now = self.inner.now();
+        let oldest_live = self.inner.oldest_live();
+        let cas = self.inner.next_cas();
+
+        let result = self.inner.items.entry(&args.key, None, |_k, item| {
+            if item.is_expired(now, oldest_live) {
+                EntryAction::Remove
+            } else {
+                *item = Item::new(args.data.clone(), args.flags, args.exptime, cas, now);
+                EntryAction::Retain(())
             }
-            StoreOp::Append | StoreOp::Prepend => {
-                let is_append = op == StoreOp::Append;
+        });
 
-                let result = self.inner.items.entry(&args.key, None, |_k, item| {
-                    if item.is_expired(now, oldest_live) {
-                        return EntryAction::Remove;
-                    }
+        match result {
+            EntryResult::Retained(()) => {
+                stats::TOTAL_ITEMS.add(1);
+                Response::Stored
+            }
+            EntryResult::Removed(..) => {
+                stats::GET_EXPIRED.add(1);
+                Response::NotStored
+            }
+            EntryResult::Vacant(_) => Response::NotStored,
+            _ => unreachable!(),
+        }
+    }
 
-                    let mut new_data = BytesMut::with_capacity(item.data.len() + args.data.len());
-                    let (first, second) = if is_append {
-                        (item.data.as_ref(), args.data.as_ref())
-                    } else {
-                        (args.data.as_ref(), item.data.as_ref())
-                    };
+    fn store_append_or_prepend(&self, op: StoreOp, args: StoreArgs) -> Response {
+        let now = self.inner.now();
+        let oldest_live = self.inner.oldest_live();
+        let cas = self.inner.next_cas();
+        let is_append = op == StoreOp::Append;
 
-                    new_data.extend_from_slice(first);
-                    new_data.extend_from_slice(second);
-
-                    item.data = new_data.freeze();
-                    item.cas = cas;
-                    EntryAction::Retain(())
-                });
-
-                match result {
-                    EntryResult::Retained(()) => {
-                        stats::TOTAL_ITEMS.add(1);
-                        Response::Stored
-                    }
-                    _ => Response::NotStored,
-                }
+        let result = self.inner.items.entry(&args.key, None, |_k, item| {
+            if item.is_expired(now, oldest_live) {
+                return EntryAction::Remove;
             }
 
-            StoreOp::Cas => {
-                let Some(expected_cas) = args.cas else {
-                    tracing::warn!("received cas command without a cas token");
-                    return Response::ServerError("missing cas value");
-                };
+            let mut new_data = BytesMut::with_capacity(item.data.len() + args.data.len());
+            let (first, second) = if is_append {
+                (item.data.as_ref(), args.data.as_ref())
+            } else {
+                (args.data.as_ref(), item.data.as_ref())
+            };
 
-                let result = self.inner.items.entry(&args.key, None, |_k, item| {
-                    if item.is_expired(now, oldest_live) {
-                        return EntryAction::Remove;
-                    }
+            new_data.extend_from_slice(first);
+            new_data.extend_from_slice(second);
 
-                    if item.cas != expected_cas {
-                        tracing::debug!(expected = expected_cas, actual = item.cas, "cas mismatch");
-                        return EntryAction::Retain(false);
-                    }
+            item.data = new_data.freeze();
+            item.cas = cas;
+            EntryAction::Retain(())
+        });
 
-                    *item = Item::new(args.data.clone(), args.flags, args.exptime, cas, now);
-                    EntryAction::Retain(true)
-                });
-
-                match result {
-                    EntryResult::Retained(true) => {
-                        stats::CAS_HITS.add(1);
-                        stats::TOTAL_ITEMS.add(1);
-                        Response::Stored
-                    }
-                    EntryResult::Retained(false) => {
-                        stats::CAS_BADVAL.add(1);
-                        Response::Exists
-                    }
-                    EntryResult::Removed(..) | EntryResult::Vacant(_) => {
-                        stats::CAS_MISSES.add(1);
-                        Response::NotFound
-                    }
-                    _ => Response::NotFound,
-                }
+        match result {
+            EntryResult::Retained(()) => {
+                stats::TOTAL_ITEMS.add(1);
+                Response::Stored
             }
+            EntryResult::Removed(..) => {
+                stats::GET_EXPIRED.add(1);
+                Response::NotStored
+            }
+            EntryResult::Vacant(_) => Response::NotStored,
+            _ => unreachable!(),
+        }
+    }
+
+    fn store_cas(&self, args: StoreArgs) -> Response {
+        let Some(expected_cas) = args.cas else {
+            tracing::warn!("received cas command without a cas token");
+            return Response::ServerError("missing cas value");
+        };
+
+        let now = self.inner.now();
+        let oldest_live = self.inner.oldest_live();
+        let cas = self.inner.next_cas();
+
+        let result = self.inner.items.entry(&args.key, None, |_k, item| {
+            if item.is_expired(now, oldest_live) {
+                return EntryAction::Remove;
+            }
+
+            if item.cas != expected_cas {
+                tracing::debug!(expected = expected_cas, actual = item.cas, "cas mismatch");
+                return EntryAction::Retain(false);
+            }
+
+            *item = Item::new(args.data.clone(), args.flags, args.exptime, cas, now);
+            EntryAction::Retain(true)
+        });
+
+        match result {
+            EntryResult::Retained(true) => {
+                stats::CAS_HITS.add(1);
+                stats::TOTAL_ITEMS.add(1);
+                Response::Stored
+            }
+            EntryResult::Retained(false) => {
+                stats::CAS_BADVAL.add(1);
+                Response::Exists
+            }
+            EntryResult::Removed(..) => {
+                stats::GET_EXPIRED.add(1);
+                stats::CAS_MISSES.add(1);
+                Response::NotFound
+            }
+            EntryResult::Vacant(_) => {
+                stats::CAS_MISSES.add(1);
+                Response::NotFound
+            }
+            _ => unreachable!(),
         }
     }
 
@@ -437,14 +475,16 @@ impl Store {
                 Response::Number(new_val)
             }
             EntryResult::Retained(Err(msg)) => Response::ClientError(msg),
-            EntryResult::Removed(..) | EntryResult::Vacant(_) => {
+            EntryResult::Removed(..) => {
+                stats::GET_EXPIRED.add(1);
                 misses.add(1);
                 Response::NotFound
             }
-            _ => {
+            EntryResult::Vacant(_) => {
                 misses.add(1);
                 Response::NotFound
             }
+            _ => unreachable!(),
         }
     }
 
@@ -471,14 +511,16 @@ impl Store {
                 stats::TOUCH_HITS.add(1);
                 Response::Touched
             }
-            EntryResult::Removed(..) | EntryResult::Vacant(_) => {
+            EntryResult::Removed(..) => {
+                stats::GET_EXPIRED.add(1);
                 stats::TOUCH_MISSES.add(1);
                 Response::NotFound
             }
-            _ => {
+            EntryResult::Vacant(_) => {
                 stats::TOUCH_MISSES.add(1);
                 Response::NotFound
             }
+            _ => unreachable!(),
         }
     }
 
