@@ -531,6 +531,8 @@ impl Store {
 
         match delay {
             Some(0) | None => {
+                // Immediate flush replaces any delayed one
+                self.inner.oldest_live.store(0, Ordering::Relaxed);
                 self.inner.items.clear();
             }
             Some(n) => {
@@ -1187,6 +1189,23 @@ mod tests {
         store.flush(Some(30));
 
         assert_eq!(store.inner.oldest_live(), Some(1_030));
+    }
+
+    #[test]
+    fn flush_all_immediate_cancels_pending_delayed_flush() {
+        let clock = Clock::mock(TEST_NOW);
+        let store = Store::new(clock.clone(), TEST_MEMORY_LIMIT);
+
+        store.flush(Some(10));
+        store.flush(None);
+        store.store(StoreOp::Set, store_args("foo", 0, 0, b"hello", None));
+        clock.advance(11);
+
+        match store.get(&[Bytes::from_static(b"foo")], false) {
+            Response::Values(values) => assert_eq!(values.len(), 1),
+            other => panic!("expected Values, got {other:?}"),
+        }
+        assert_eq!(store.inner.oldest_live(), None);
     }
 
     #[test]
