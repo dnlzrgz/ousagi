@@ -12,6 +12,7 @@ use quick_cache::{
 use crate::{
     clock::{Clock, SharedClock},
     commands::{ArithmeticOp, Response, StoreArgs, StoreOp},
+    parser::MAX_ITEM_SIZE,
     stats,
 };
 
@@ -332,7 +333,12 @@ impl Store {
                 return EntryAction::Remove;
             }
 
-            let mut new_data = BytesMut::with_capacity(item.data.len() + args.data.len());
+            let new_len = item.data.len() + args.data.len();
+            if new_len > MAX_ITEM_SIZE {
+                return EntryAction::Retain(false);
+            }
+
+            let mut new_data = BytesMut::with_capacity(new_len);
             let (first, second) = if is_append {
                 (item.data.as_ref(), args.data.as_ref())
             } else {
@@ -344,14 +350,15 @@ impl Store {
 
             item.data = new_data.freeze();
             item.cas = cas;
-            EntryAction::Retain(())
+            EntryAction::Retain(true)
         });
 
         match result {
-            EntryResult::Retained(()) => {
+            EntryResult::Retained(true) => {
                 stats::TOTAL_ITEMS.add(1);
                 Response::Stored
             }
+            EntryResult::Retained(false) => Response::NotStored,
             EntryResult::Removed(..) => {
                 stats::GET_EXPIRED.add(1);
                 Response::NotStored
@@ -931,6 +938,25 @@ mod tests {
 
         let item = store.inner.items.get("foo".as_bytes()).unwrap();
         assert_eq!(item.data().as_ref(), b"hello world");
+    }
+
+    #[test]
+    fn append_or_prepend_past_max_item_size_returns_not_stored() {
+        let store = Store::new(Clock::mock(TEST_NOW), 64 * TEST_MEMORY_LIMIT);
+        let full = vec![b'x'; MAX_ITEM_SIZE];
+        store
+            .inner
+            .items
+            .insert(Bytes::from_static(b"foo"), mock_item(&full, 0, 0, 1));
+
+        for op in [StoreOp::Append, StoreOp::Prepend] {
+            let resp = store.store(op, store_args("foo", 0, 0, b"y", None));
+            assert!(matches!(resp, Response::NotStored));
+        }
+
+        let item = store.inner.items.get("foo".as_bytes()).unwrap();
+        assert_eq!(item.data().len(), MAX_ITEM_SIZE);
+        assert_eq!(item.cas(), 1);
     }
 
     #[test]

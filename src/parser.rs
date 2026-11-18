@@ -4,7 +4,7 @@ use bytes::Bytes;
 use crate::commands::{ArithmeticOp, Command, Response, StoreArgs, StoreOp};
 
 const MAX_KEY_LEN: usize = 250;
-const MAX_ITEM_SIZE: usize = 1024 * 1024; // 1 MiB
+pub(crate) const MAX_ITEM_SIZE: usize = 1024 * 1024; // 1 MiB
 
 #[derive(Debug)]
 pub enum ParseErrorKind {
