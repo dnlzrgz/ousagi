@@ -48,7 +48,7 @@ fn bench_get_and_touch(c: &mut Criterion) {
     let key = [Bytes::from_static(b"foo")];
 
     group.bench_function("hit", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || populated_store("foo", b"a value stored in the cache"),
             |store| black_box(store.get_and_touch(black_box(&key), 100, false)),
             BatchSize::SmallInput,
@@ -58,12 +58,12 @@ fn bench_get_and_touch(c: &mut Criterion) {
     group.finish();
 }
 
-fn store_args(key: &Bytes, data: &[u8], cas: Option<u64>) -> StoreArgs {
+fn store_args(key: &Bytes, data: &'static [u8], cas: Option<u64>) -> StoreArgs {
     StoreArgs {
         key: key.clone(),
         flags: 0,
         exptime: 0,
-        data: Bytes::copy_from_slice(data),
+        data: Bytes::from_static(data),
         noreply: false,
         cas,
     }
@@ -74,7 +74,7 @@ fn bench_set(c: &mut Criterion) {
     let key = Bytes::from_static(b"foo");
 
     group.bench_function("set", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             empty_store,
             |store| black_box(store.store(StoreOp::Set, store_args(&key, b"value", None))),
             BatchSize::SmallInput,
@@ -82,7 +82,7 @@ fn bench_set(c: &mut Criterion) {
     });
 
     group.bench_function("add_new_key", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             empty_store,
             |store| black_box(store.store(StoreOp::Add, store_args(&key, b"value", None))),
             BatchSize::SmallInput,
@@ -90,7 +90,7 @@ fn bench_set(c: &mut Criterion) {
     });
 
     group.bench_function("append", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || populated_store("foo", b"value"),
             |store| black_box(store.store(StoreOp::Append, store_args(&key, b" more", None))),
             BatchSize::SmallInput,
@@ -105,17 +105,17 @@ fn bench_cas(c: &mut Criterion) {
     let key = Bytes::from_static(b"foo");
 
     group.bench_function("success", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || {
                 let store = populated_store("foo", b"value");
-                let cas = match store.get(&[key.clone()], true) {
+                let cas = match store.get(std::slice::from_ref(&key), true) {
                     Response::Values(values) => values[0].3.expect("cas token"),
                     other => panic!("expected Values, got {other:?}"),
                 };
                 (store, cas)
             },
             |(store, cas)| {
-                black_box(store.store(StoreOp::Cas, store_args(&key, b"new value", Some(cas))))
+                black_box(store.store(StoreOp::Cas, store_args(&key, b"new value", Some(*cas))))
             },
             BatchSize::SmallInput,
         )
@@ -129,7 +129,7 @@ fn bench_delete(c: &mut Criterion) {
     let key = Bytes::from_static(b"foo");
 
     group.bench_function("existing_key", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || populated_store("foo", b"value"),
             |store| black_box(store.delete(black_box(&key))),
             BatchSize::SmallInput,
@@ -144,7 +144,7 @@ fn bench_arithmetic(c: &mut Criterion) {
     let key = Bytes::from_static(b"foo");
 
     group.bench_function("incr", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || populated_store("foo", b"10"),
             |store| black_box(store.arithmetic(ArithmeticOp::Incr, black_box(&key), 5)),
             BatchSize::SmallInput,
@@ -152,7 +152,7 @@ fn bench_arithmetic(c: &mut Criterion) {
     });
 
     group.bench_function("decr", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || populated_store("foo", b"10"),
             |store| black_box(store.arithmetic(ArithmeticOp::Decr, black_box(&key), 5)),
             BatchSize::SmallInput,
@@ -167,7 +167,7 @@ fn bench_touch(c: &mut Criterion) {
     let key = Bytes::from_static(b"foo");
 
     group.bench_function("existing_key", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || populated_store("foo", b"value"),
             |store| black_box(store.touch(black_box(&key), 100)),
             BatchSize::SmallInput,
@@ -181,7 +181,7 @@ fn bench_flush(c: &mut Criterion) {
     let mut group = c.benchmark_group("store_flush");
 
     group.bench_function("immediate", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || populated_store("foo", b"value"),
             |store| black_box(store.flush(None)),
             BatchSize::SmallInput,

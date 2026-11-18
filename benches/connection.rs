@@ -30,7 +30,10 @@ fn bench_read_line(c: &mut Criterion) {
     group.bench_function("short_key", |b| {
         b.to_async(&rt).iter_batched(
             || setup(short),
-            |mut conn| async move { black_box(conn.read_line().await.unwrap()) },
+            |mut conn| async move {
+                let line = conn.read_line().await.unwrap();
+                (conn, line)
+            },
             BatchSize::SmallInput,
         );
     });
@@ -41,13 +44,16 @@ fn bench_read_line(c: &mut Criterion) {
     group.bench_function("long_key", |b| {
         b.to_async(&rt).iter_batched(
             || setup(long_key),
-            |mut conn| async move { black_box(conn.read_line().await.unwrap()) },
+            |mut conn| async move {
+                let line = conn.read_line().await.unwrap();
+                (conn, line)
+            },
             BatchSize::SmallInput,
         );
     });
 
     for &n in &[10usize, 100, 1_000] {
-        let text: String = std::iter::repeat("get foo\r\n").take(n).collect();
+        let text = "get foo\r\n".repeat(n);
         let request = leak(text.into_bytes());
         group.throughput(Throughput::Bytes(request.len() as u64));
         group.bench_with_input(BenchmarkId::new("pipelined", n), &request, |b, &request| {
@@ -57,6 +63,7 @@ fn bench_read_line(c: &mut Criterion) {
                     for _ in 0..n {
                         black_box(conn.read_line().await.unwrap());
                     }
+                    conn
                 },
                 BatchSize::SmallInput,
             );
@@ -85,7 +92,10 @@ fn bench_read_payload(c: &mut Criterion) {
             |b, &request| {
                 b.to_async(&rt).iter_batched(
                     || setup(request),
-                    move |mut conn| async move { black_box(conn.read_payload(len).await.unwrap()) },
+                    move |mut conn| async move {
+                        let data = conn.read_payload(len).await.unwrap();
+                        (conn, data)
+                    },
                     BatchSize::SmallInput,
                 );
             },
@@ -99,7 +109,7 @@ fn command_with_payload(header: &str, len: usize) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(header.as_bytes());
     buf.extend_from_slice(b"\r\n");
-    buf.extend(std::iter::repeat(b'x').take(len));
+    buf.resize(buf.len() + len, b'x');
     buf.extend_from_slice(b"\r\n");
     buf
 }
@@ -113,7 +123,10 @@ fn bench_read_command(c: &mut Criterion) {
     group.bench_function("get", |b| {
         b.to_async(&rt).iter_batched(
             || setup(get),
-            |mut conn| async move { black_box(conn.read_command().await.unwrap()) },
+            |mut conn| async move {
+                let cmd = conn.read_command().await.unwrap();
+                (conn, cmd)
+            },
             BatchSize::SmallInput,
         );
     });
@@ -123,7 +136,10 @@ fn bench_read_command(c: &mut Criterion) {
     group.bench_function("set_512b", |b| {
         b.to_async(&rt).iter_batched(
             || setup(set_512),
-            |mut conn| async move { black_box(conn.read_command().await.unwrap()) },
+            |mut conn| async move {
+                let cmd = conn.read_command().await.unwrap();
+                (conn, cmd)
+            },
             BatchSize::SmallInput,
         );
     });
@@ -140,7 +156,8 @@ fn bench_write_response(c: &mut Criterion) {
             || setup(b""),
             |mut conn| async move {
                 conn.write_response(&Response::Stored).await.unwrap();
-                black_box(conn.write_response(&Response::Stored).await.unwrap());
+                conn.write_response(&Response::Stored).await.unwrap();
+                conn
             },
             BatchSize::SmallInput,
         );
@@ -162,7 +179,10 @@ fn bench_write_response(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("values", n), &resp, |b, resp| {
             b.to_async(&rt).iter_batched(
                 || setup(b""),
-                |mut conn| async move { black_box(conn.write_response(resp).await.unwrap()) },
+                |mut conn| async move {
+                    conn.write_response(resp).await.unwrap();
+                    conn
+                },
                 BatchSize::SmallInput,
             );
         });
