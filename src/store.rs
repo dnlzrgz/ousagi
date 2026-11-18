@@ -471,7 +471,7 @@ impl Store {
                 ArithmeticOp::Decr => val.saturating_sub(delta),
             };
 
-            item.data = Bytes::from(new_val.to_string());
+            item.data = Bytes::copy_from_slice(itoa::Buffer::new().format(new_val).as_bytes());
             item.cas = cas;
 
             EntryAction::Retain(Ok(new_val))
