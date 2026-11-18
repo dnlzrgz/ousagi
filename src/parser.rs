@@ -263,9 +263,9 @@ fn parse_store(op: StoreOp, tokenizer: &mut Tokenizer) -> Result<CommandHeader, 
         return Err(ParseError::new(ParseErrorKind::TooLarge).with_discard(len + 2));
     }
 
-    let key = tokenizer
-        .extract_key(key)
-        .map_err(|e| e.with_discard(len + 2))?;
+    validate_key(key)
+        .map_err(|_| ParseError::new(ParseErrorKind::BadFormat).with_discard(len + 2))?;
+    let key = Bytes::copy_from_slice(key);
     let flags: u32 = parse_field(flags)
         .map_err(|_| ParseError::new(ParseErrorKind::BadFormat).with_discard(len + 2))?;
     let exptime: i64 = parse_field(exptime)
@@ -673,6 +673,18 @@ mod tests {
         let pending = expect_store(&input);
 
         assert_eq!(pending.len, MAX_ITEM_SIZE);
+    }
+
+    #[test]
+    fn set_key_does_not_share_the_line_buffer() {
+        let input = line("set foo 0 0 5");
+        let pending = match parse_command_line(&input).expect("should parse correctly") {
+            CommandHeader::Store(pending) => pending,
+            other => panic!("expected Store header, got {other:?}"),
+        };
+
+        assert_eq!(pending.key, Bytes::from_static(b"foo"));
+        assert!(!input.as_ptr_range().contains(&pending.key.as_ptr()));
     }
 
     #[test]
