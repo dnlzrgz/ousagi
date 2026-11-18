@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use clap::{ArgAction, Parser};
 
 #[derive(Parser, Debug)]
@@ -8,7 +10,7 @@ pub struct Cli {
 
     /// Interface to listen on, default INADDR_ANY
     #[arg(short = 'l', long)]
-    pub listen: Option<String>,
+    pub listen: Option<IpAddr>,
 
     /// Number of threads to process incoming requests
     #[arg(short = 't', long, default_value_t = 4, value_parser = parse_threads)]
@@ -47,5 +49,16 @@ mod tests {
     #[test]
     fn cli_parses_correctly() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn listen_accepts_ipv6() {
+        let cli = Cli::try_parse_from(["ousagi", "-l", "::1"]).unwrap();
+        assert_eq!(cli.listen, Some(IpAddr::from([0, 0, 0, 0, 0, 0, 0, 1])));
+    }
+
+    #[test]
+    fn listen_rejects_invalid_address() {
+        assert!(Cli::try_parse_from(["ousagi", "-l", "not-an-ip"]).is_err());
     }
 }

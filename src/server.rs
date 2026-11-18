@@ -1,4 +1,8 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use tokio::{net::TcpListener, sync::Semaphore};
 
@@ -6,15 +10,9 @@ use crate::{
     cli::Cli, clock::spawn_clock, session, shutdown::shutdown_signal, stats, store::Store,
 };
 
-fn resolve_addr(args: &Cli) -> SocketAddr {
-    let ip = args.listen.as_deref().unwrap_or("0.0.0.0");
-    format!("{ip}:{}", args.port)
-        .parse()
-        .expect("invalid --listen/--port")
-}
-
 pub async fn run(args: Cli) {
-    let addr = resolve_addr(&args);
+    let ip = args.listen.unwrap_or(Ipv4Addr::UNSPECIFIED.into());
+    let addr = SocketAddr::new(ip, args.port);
     let listener = TcpListener::bind(addr).await.unwrap();
     tracing::info!(addr = %addr, threads = args.threads, "listening");
 
