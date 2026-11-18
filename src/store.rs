@@ -173,28 +173,22 @@ impl Store {
         let mut values = Vec::with_capacity(keys.len());
 
         for key in keys {
-            let result = self.inner.items.entry(key, None, |_key, item| {
-                if item.is_expired(now, oldest_live) {
-                    EntryAction::Remove
-                } else {
-                    EntryAction::Retain((item.flags(), item.data().clone(), item.cas()))
-                }
-            });
-
-            match result {
-                EntryResult::Retained((flags, data, cas)) => {
+            match self.inner.items.get(key) {
+                Some(item) if !item.is_expired(now, oldest_live) => {
                     stats::GET_HITS.add(1);
-                    let cas = with_cas.then_some(cas);
-                    values.push((key.clone(), flags, data, cas));
+                    let cas = with_cas.then_some(item.cas());
+                    values.push((key.clone(), item.flags(), item.data, cas));
                 }
-                EntryResult::Removed(..) => {
+                Some(_) => {
+                    self.inner
+                        .items
+                        .remove_if(key, |item| item.is_expired(now, oldest_live));
                     stats::GET_EXPIRED.add(1);
                     stats::GET_MISSES.add(1);
                 }
-                EntryResult::Vacant(_) => {
+                None => {
                     stats::GET_MISSES.add(1);
                 }
-                _ => unreachable!(),
             }
         }
 
