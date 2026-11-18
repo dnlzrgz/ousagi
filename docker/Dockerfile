@@ -1,4 +1,4 @@
-ARG RUST_VERSION=1.98
+ARG RUST_VERSION=1.100.0
 ARG APP_NAME=ousagi
 
 FROM rust:${RUST_VERSION}-alpine AS build
@@ -16,7 +16,7 @@ RUN --mount=type=bind,source=src,target=src \
     CARGO_HOME=/var/cache/cargo cargo build --locked --release && \
     cp ./target/release/$APP_NAME /bin/server
 
-FROM alpine:3.24.1
+FROM alpine:3.24.4
 
 ARG UID=10001
 RUN adduser \

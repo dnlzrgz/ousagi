@@ -40,7 +40,7 @@ services:
       - bench
 
   memtier:
-    image: redislabs/memtier_benchmark:2.5.1
+    image: redislabs/memtier_benchmark:2.6.1
     networks:
       - bench
 

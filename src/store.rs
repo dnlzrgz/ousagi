@@ -16,6 +16,7 @@ use crate::{
 };
 
 const THIRTY_DAYS_SECS: i64 = 60 * 60 * 24 * 30;
+const ITEM_OVERHEAD_BYTES: u64 = 64;
 
 #[derive(Clone)]
 pub struct Item {
@@ -71,11 +72,10 @@ impl Item {
             return true;
         }
 
-        if let Some(cutoff) = oldest_live {
-            if now >= cutoff && self.stored_at() < cutoff {
+        if let Some(cutoff) = oldest_live
+            && now >= cutoff && self.stored_at() < cutoff {
                 return true;
             }
-        }
 
         false
     }
@@ -86,8 +86,7 @@ struct ItemWeighter;
 
 impl Weighter<Bytes, Item> for ItemWeighter {
     fn weight(&self, key: &Bytes, item: &Item) -> u64 {
-        const OVERHEAD: usize = 64;
-        (key.len() + item.data().len() + OVERHEAD) as u64
+        (key.len() + item.data().len()) as u64 + ITEM_OVERHEAD_BYTES
     }
 }
 

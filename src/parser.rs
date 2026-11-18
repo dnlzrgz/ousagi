@@ -256,7 +256,9 @@ fn parse_store(op: StoreOp, tokenizer: &mut Tokenizer) -> Result<CommandHeader, 
         _ => return Err(ParseError::new(ParseErrorKind::Unknown)),
     };
 
-    let len: usize = parse_field(len).map_err(|_| ParseError::new(ParseErrorKind::BadFormat))?;
+    // u32 like memcached, so `len + 2` below can't overflow
+    let len =
+        parse_field::<u32>(len).map_err(|_| ParseError::new(ParseErrorKind::BadFormat))? as usize;
     if len > MAX_ITEM_SIZE {
         return Err(ParseError::new(ParseErrorKind::TooLarge).with_discard(len + 2));
     }
@@ -655,6 +657,14 @@ mod tests {
 
         assert!(matches!(err.kind, ParseErrorKind::TooLarge));
         assert_eq!(err.discard(), Some(MAX_ITEM_SIZE + 1 + 2));
+    }
+
+    #[test]
+    fn set_len_beyond_u32_fails_without_discard() {
+        let err = expect_error("set foo 0 0 18446744073709551615");
+
+        assert!(matches!(err.kind, ParseErrorKind::BadFormat));
+        assert_eq!(err.discard(), None);
     }
 
     #[test]

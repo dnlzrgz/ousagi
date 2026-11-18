@@ -70,7 +70,7 @@ impl Command {
         match self {
             Command::Get { .. } => false,
             Command::GetAndTouch { .. } => false,
-            Command::Stats { .. } => false,
+            Command::Stats => false,
             Command::Version => false,
             Command::Store(_, args) => args.noreply,
             Command::Delete { noreply, .. }
