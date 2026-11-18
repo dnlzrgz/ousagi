@@ -6,6 +6,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
 use crate::{
     commands::{Command, Response},
     parser::{CommandHeader, parse_command_line},
+    stats,
 };
 
 const MAX_LINE_LEN: u64 = 8 * 1024; // bytes
@@ -80,7 +81,9 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
 
         while data.len() < len {
             self.writer.flush().await?;
-            if self.reader.read_buf(&mut data).await? == 0 {
+            let n = self.reader.read_buf(&mut data).await?;
+            stats::BYTES_READ.add(n);
+            if n == 0 {
                 return Err(PayloadError::Io(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "connection closed mid-payload",
@@ -155,34 +158,34 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
 
     pub async fn write_response(&mut self, resp: &Response) -> io::Result<()> {
         match resp {
-            Response::Stored => self.writer.write_all(b"STORED\r\n").await?,
-            Response::NotStored => self.writer.write_all(b"NOT_STORED\r\n").await?,
-            Response::Deleted => self.writer.write_all(b"DELETED\r\n").await?,
-            Response::NotFound => self.writer.write_all(b"NOT_FOUND\r\n").await?,
-            Response::Exists => self.writer.write_all(b"EXISTS\r\n").await?,
+            Response::Stored => self.write(b"STORED\r\n").await?,
+            Response::NotStored => self.write(b"NOT_STORED\r\n").await?,
+            Response::Deleted => self.write(b"DELETED\r\n").await?,
+            Response::NotFound => self.write(b"NOT_FOUND\r\n").await?,
+            Response::Exists => self.write(b"EXISTS\r\n").await?,
             Response::Number(val) => {
                 let mut buf = itoa::Buffer::new();
-                self.writer.write_all(buf.format(*val).as_bytes()).await?;
-                self.writer.write_all(b"\r\n").await?;
+                self.write(buf.format(*val).as_bytes()).await?;
+                self.write(b"\r\n").await?;
             }
-            Response::Error => self.writer.write_all(b"ERROR\r\n").await?,
-            Response::Ok => self.writer.write_all(b"OK\r\n").await?,
+            Response::Error => self.write(b"ERROR\r\n").await?,
+            Response::Ok => self.write(b"OK\r\n").await?,
             Response::Version(version) => {
-                self.writer.write_all(b"VERSION ").await?;
-                self.writer.write_all(version.as_bytes()).await?;
-                self.writer.write_all(b"\r\n").await?;
+                self.write(b"VERSION ").await?;
+                self.write(version.as_bytes()).await?;
+                self.write(b"\r\n").await?;
             }
             Response::ClientError(msg) => {
-                self.writer.write_all(b"CLIENT_ERROR ").await?;
-                self.writer.write_all(msg.as_bytes()).await?;
-                self.writer.write_all(b"\r\n").await?;
+                self.write(b"CLIENT_ERROR ").await?;
+                self.write(msg.as_bytes()).await?;
+                self.write(b"\r\n").await?;
             }
             Response::ServerError(msg) => {
-                self.writer.write_all(b"SERVER_ERROR ").await?;
-                self.writer.write_all(msg.as_bytes()).await?;
-                self.writer.write_all(b"\r\n").await?;
+                self.write(b"SERVER_ERROR ").await?;
+                self.write(msg.as_bytes()).await?;
+                self.write(b"\r\n").await?;
             }
-            Response::Touched => self.writer.write_all(b"TOUCHED\r\n").await?,
+            Response::Touched => self.write(b"TOUCHED\r\n").await?,
             Response::Values(values) => {
                 let mut itoa_buf = itoa::Buffer::new();
                 let mut header_buf = BytesMut::with_capacity(256);
@@ -201,24 +204,24 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                     }
                     header_buf.extend_from_slice(b"\r\n");
 
-                    self.writer.write_all(&header_buf).await?;
-                    self.writer.write_all(data).await?;
-                    self.writer.write_all(b"\r\n").await?;
+                    self.write(&header_buf).await?;
+                    self.write(data).await?;
+                    self.write(b"\r\n").await?;
 
                     header_buf.clear();
                 }
 
-                self.writer.write_all(b"END\r\n").await?;
+                self.write(b"END\r\n").await?;
             }
             Response::Stats(entries) => {
                 for (name, value) in entries {
-                    self.writer.write_all(b"STAT ").await?;
-                    self.writer.write_all(name.as_bytes()).await?;
-                    self.writer.write_all(b" ").await?;
-                    self.writer.write_all(value.as_bytes()).await?;
-                    self.writer.write_all(b"\r\n").await?;
+                    self.write(b"STAT ").await?;
+                    self.write(name.as_bytes()).await?;
+                    self.write(b" ").await?;
+                    self.write(value.as_bytes()).await?;
+                    self.write(b"\r\n").await?;
                 }
-                self.writer.write_all(b"END\r\n").await?;
+                self.write(b"END\r\n").await?;
             }
         }
 
@@ -233,7 +236,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
         if n > 0 {
             self.writer.flush().await?;
             let mut limited = (&mut self.reader).take(n as u64);
-            tokio::io::copy(&mut limited, &mut tokio::io::sink()).await?;
+            let n = tokio::io::copy(&mut limited, &mut tokio::io::sink()).await?;
+            stats::BYTES_READ.add(n as usize);
         }
 
         Ok(())
@@ -247,7 +251,9 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
             }
 
             self.buffer.clear();
-            if self.reader.read_buf(&mut self.buffer).await? == 0 {
+            let n = self.reader.read_buf(&mut self.buffer).await?;
+            stats::BYTES_READ.add(n);
+            if n == 0 {
                 return Ok(()); // EOF
             }
         }
@@ -256,6 +262,41 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
     async fn fill_buffer(&mut self) -> io::Result<usize> {
         self.writer.flush().await?;
         self.buffer.reserve(4096);
-        self.reader.read_buf(&mut self.buffer).await
+        let n = self.reader.read_buf(&mut self.buffer).await?;
+        stats::BYTES_READ.add(n);
+        Ok(n)
+    }
+
+    async fn write(&mut self, buf: &[u8]) -> io::Result<()> {
+        stats::BYTES_WRITTEN.add(buf.len());
+        self.writer.write_all(buf).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use contatori::counters::Observable;
+
+    #[tokio::test]
+    async fn counts_bytes_read_and_written() {
+        let (mut client, server) = tokio::io::duplex(64);
+        let (r, w) = tokio::io::split(server);
+        let mut conn = Connection::new(r, w);
+        let read_before = stats::BYTES_READ.value().as_u64();
+        let written_before = stats::BYTES_WRITTEN.value().as_u64();
+
+        client.write_all(b"version\r\n").await.unwrap();
+        let cmd = conn.read_command().await.unwrap();
+        assert!(matches!(cmd, Some(Command::Version)));
+        conn.write_response(&Response::Version("1.0"))
+            .await
+            .unwrap();
+
+        assert_eq!(stats::BYTES_READ.value().as_u64() - read_before, 9);
+        assert_eq!(
+            stats::BYTES_WRITTEN.value().as_u64() - written_before,
+            b"VERSION 1.0\r\n".len() as u64
+        );
     }
 }

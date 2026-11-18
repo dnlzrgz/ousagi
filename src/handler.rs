@@ -6,7 +6,7 @@ use crate::{
     store::Store,
 };
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[instrument(skip(store), level = Level::DEBUG)]
 pub fn handle(cmd: Command, store: &Store) -> Response {
@@ -24,6 +24,6 @@ pub fn handle(cmd: Command, store: &Store) -> Response {
         Command::FlushAll { delay, .. } => store.flush(delay),
         Command::Version => Response::Version(VERSION),
         Command::Verbosity { .. } => Response::Ok,
-        Command::Stats => Response::Stats(stats::report(store.item_count())),
+        Command::Stats => Response::Stats(stats::report(store.item_count(), store.clock())),
     }
 }

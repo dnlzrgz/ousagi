@@ -10,6 +10,7 @@ use tokio::time;
 
 pub struct Clock {
     secs: AtomicU64,
+    started: u64,
 }
 
 fn unix_now_secs() -> u64 {
@@ -24,6 +25,10 @@ impl Clock {
         self.secs.load(Ordering::Relaxed)
     }
 
+    pub fn uptime(&self) -> u64 {
+        self.now().saturating_sub(self.started)
+    }
+
     fn set(&self, secs: u64) {
         self.secs.store(secs, Ordering::Relaxed);
     }
@@ -31,6 +36,7 @@ impl Clock {
     pub fn mock(start_secs: u64) -> SharedClock {
         Arc::new(Clock {
             secs: AtomicU64::new(start_secs),
+            started: start_secs,
         })
     }
     #[cfg(test)]
@@ -42,8 +48,10 @@ impl Clock {
 pub type SharedClock = Arc<Clock>;
 
 pub fn spawn_clock() -> SharedClock {
+    let now = unix_now_secs();
     let clock = Arc::new(Clock {
-        secs: AtomicU64::new(unix_now_secs()),
+        secs: AtomicU64::new(now),
+        started: now,
     });
 
     let bg = clock.clone();

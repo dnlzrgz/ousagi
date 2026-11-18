@@ -10,7 +10,7 @@ use quick_cache::{
 };
 
 use crate::{
-    clock::SharedClock,
+    clock::{Clock, SharedClock},
     commands::{ArithmeticOp, Response, StoreArgs, StoreOp},
     stats,
 };
@@ -73,9 +73,11 @@ impl Item {
         }
 
         if let Some(cutoff) = oldest_live
-            && now >= cutoff && self.stored_at() < cutoff {
-                return true;
-            }
+            && now >= cutoff
+            && self.stored_at() < cutoff
+        {
+            return true;
+        }
 
         false
     }
@@ -200,7 +202,7 @@ impl Store {
 
     pub fn get_and_touch(&self, keys: &[Bytes], exptime: i64, with_cas: bool) -> Response {
         let now = self.inner.now();
-        stats::CMD_GET.add(keys.len());
+        stats::CMD_TOUCH.add(keys.len());
 
         let oldest_live = self.inner.oldest_live();
         let mut values = Vec::with_capacity(keys.len());
@@ -219,15 +221,15 @@ impl Store {
 
             match result {
                 EntryResult::Retained((flags, data, cas)) => {
-                    stats::GET_HITS.add(1);
+                    stats::TOUCH_HITS.add(1);
                     values.push((key.clone(), flags, data, with_cas.then_some(cas)));
                 }
                 EntryResult::Removed(..) => {
                     stats::GET_EXPIRED.add(1);
-                    stats::GET_MISSES.add(1);
+                    stats::TOUCH_MISSES.add(1);
                 }
                 EntryResult::Vacant(_) => {
-                    stats::GET_MISSES.add(1);
+                    stats::TOUCH_MISSES.add(1);
                 }
                 _ => unreachable!(),
             }
@@ -541,6 +543,10 @@ impl Store {
 
     pub fn item_count(&self) -> usize {
         self.inner.items.len()
+    }
+
+    pub fn clock(&self) -> &Clock {
+        &self.inner.shared_clock
     }
 }
 
