@@ -65,6 +65,7 @@ impl Item {
         self.cas
     }
 
+    #[cfg(test)]
     pub(crate) fn expires_at(&self) -> Option<u64> {
         self.expires_at
     }
