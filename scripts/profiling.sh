@@ -33,7 +33,7 @@ while getopts ":h:p:i:l:w:s" opt; do
 done
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MEMTIER_IMAGE="redislabs/memtier_benchmark:2.5.1"
+MEMTIER_IMAGE="redislabs/memtier_benchmark:2.6.1"
 
 MEMTIER_COMMON=(
   "--server=$HOST" "--port=$PORT"

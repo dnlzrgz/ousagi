@@ -209,7 +209,6 @@ impl Store {
                 }
 
                 item.expires_at = Item::resolve_expiry(exptime, now);
-                item.cas = self.inner.next_cas();
 
                 EntryAction::Retain((item.flags(), item.data().clone(), item.cas))
             });
@@ -493,7 +492,6 @@ impl Store {
     pub fn touch(&self, key: &Bytes, exptime: i64) -> Response {
         let now = self.inner.now();
         let oldest_live = self.inner.oldest_live();
-        let cas = self.inner.next_cas();
 
         stats::CMD_TOUCH.add(1);
 
@@ -503,7 +501,6 @@ impl Store {
             }
 
             item.expires_at = Item::resolve_expiry(exptime, now);
-            item.cas = cas;
 
             EntryAction::Retain(())
         });
@@ -803,7 +800,7 @@ mod tests {
     }
 
     #[test]
-    fn gat_hit_with_cas_returns_new_cas_token() {
+    fn gat_hit_with_cas_keeps_cas_token() {
         let store = store_with("foo", mock_item(b"hello", 42, 0, 999));
 
         let resp = store.get_and_touch(&[Bytes::from_static(b"foo")], 100, true);
@@ -811,11 +808,13 @@ mod tests {
         match resp {
             Response::Values(values) => {
                 let (_, _, _, cas) = &values[0];
-                assert!(cas.is_some());
-                assert_ne!(*cas, Some(999)); // the original cas
+                assert_eq!(*cas, Some(999));
             }
             other => panic!("expected Values, got {other:?}"),
         }
+
+        let item = store.inner.items.get("foo".as_bytes()).unwrap();
+        assert_eq!(item.cas(), 999);
     }
 
     #[test]
@@ -1159,6 +1158,15 @@ mod tests {
         let resp = store.touch(&Bytes::from_static(b"foo"), 100);
 
         assert!(matches!(resp, Response::NotFound));
+    }
+
+    #[test]
+    fn touch_keeps_cas_token() {
+        let store = store_with("foo", mock_item(b"hello", 42, 0, 7));
+        store.touch(&Bytes::from_static(b"foo"), 100);
+
+        let item = store.inner.items.get("foo".as_bytes()).unwrap();
+        assert_eq!(item.cas(), 7);
     }
 
     #[test]
