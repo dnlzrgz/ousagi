@@ -148,6 +148,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                 },
                 CommandHeader::Quit => {
                     tracing::debug!("quit");
+                    // Quit never reaches fill_buffe so the response is flushed here
+                    self.writer.flush().await?;
                     return Ok(None);
                 }
             };
@@ -277,6 +279,26 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
 mod tests {
     use super::*;
     use contatori::counters::Observable;
+
+    #[tokio::test]
+    async fn quit_flushes_responses_to_pipelined_commands() {
+        let (mut client, server) = tokio::io::duplex(64);
+        let (r, w) = tokio::io::split(server);
+        let mut conn = Connection::new(r, w);
+
+        client.write_all(b"version\r\nquit\r\n").await.unwrap();
+        let cmd = conn.read_command().await.unwrap();
+        assert!(matches!(cmd, Some(Command::Version)));
+        conn.write_response(&Response::Version("1.0"))
+            .await
+            .unwrap();
+        assert!(conn.read_command().await.unwrap().is_none());
+        drop(conn);
+
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"VERSION 1.0\r\n");
+    }
 
     #[tokio::test]
     async fn counts_bytes_read_and_written() {
