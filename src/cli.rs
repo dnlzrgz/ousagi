@@ -21,7 +21,7 @@ pub struct Cli {
     pub max_connections: usize,
 
     /// Max memory to use for cached items, in megabytes
-    #[arg(short = 'm', long, default_value_t = 64)]
+    #[arg(short = 'm', long, default_value_t = 64, value_parser = clap::value_parser!(u64).range(..=u64::MAX >> 20))]
     pub memory_limit_mb: u64,
 
     /// Verbosity level (-v, -vv, -vvv)
@@ -55,6 +55,12 @@ mod tests {
     fn listen_accepts_ipv6() {
         let cli = Cli::try_parse_from(["ousagi", "-l", "::1"]).unwrap();
         assert_eq!(cli.listen, Some(IpAddr::from([0, 0, 0, 0, 0, 0, 0, 1])));
+    }
+
+    #[test]
+    fn memory_limit_rejects_values_that_overflow_bytes() {
+        assert!(Cli::try_parse_from(["ousagi", "-m", "17592186044415"]).is_ok());
+        assert!(Cli::try_parse_from(["ousagi", "-m", "17592186044416"]).is_err());
     }
 
     #[test]

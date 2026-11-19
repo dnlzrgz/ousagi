@@ -56,7 +56,6 @@ pub struct PendingStore {
     pub flags: u32,
     pub exptime: i64,
     pub len: usize,
-    pub cas: Option<u64>,
     pub noreply: bool,
 }
 
@@ -70,7 +69,6 @@ impl PendingStore {
                 exptime: self.exptime,
                 data,
                 noreply: self.noreply,
-                cas: self.cas,
             },
         )
     }
@@ -140,12 +138,12 @@ pub fn parse_command_line(line: &Bytes) -> Result<CommandHeader, ParseError> {
     match op {
         b"get" | b"gets" => parse_get(op == b"gets", &mut tokenizer),
         b"gat" | b"gats" => parse_get_and_touch(op == b"gats", &mut tokenizer),
-        b"add" => parse_store(StoreOp::Add, &mut tokenizer),
-        b"set" => parse_store(StoreOp::Set, &mut tokenizer),
-        b"replace" => parse_store(StoreOp::Replace, &mut tokenizer),
-        b"append" => parse_store(StoreOp::Append, &mut tokenizer),
-        b"prepend" => parse_store(StoreOp::Prepend, &mut tokenizer),
-        b"cas" => parse_store(StoreOp::Cas, &mut tokenizer),
+        b"add" => parse_store(Some(StoreOp::Add), &mut tokenizer),
+        b"set" => parse_store(Some(StoreOp::Set), &mut tokenizer),
+        b"replace" => parse_store(Some(StoreOp::Replace), &mut tokenizer),
+        b"append" => parse_store(Some(StoreOp::Append), &mut tokenizer),
+        b"prepend" => parse_store(Some(StoreOp::Prepend), &mut tokenizer),
+        b"cas" => parse_store(None, &mut tokenizer),
         b"delete" => parse_delete(&mut tokenizer),
         b"incr" => parse_arithmetic(ArithmeticOp::Incr, &mut tokenizer),
         b"decr" => parse_arithmetic(ArithmeticOp::Decr, &mut tokenizer),
@@ -245,7 +243,10 @@ fn parse_get_and_touch(
     }))
 }
 
-fn parse_store(op: StoreOp, tokenizer: &mut Tokenizer) -> Result<CommandHeader, ParseError> {
+fn parse_store(
+    op: Option<StoreOp>,
+    tokenizer: &mut Tokenizer,
+) -> Result<CommandHeader, ParseError> {
     let (key, flags, exptime, len) = match (
         tokenizer.next(),
         tokenizer.next(),
@@ -271,17 +272,16 @@ fn parse_store(op: StoreOp, tokenizer: &mut Tokenizer) -> Result<CommandHeader, 
     let exptime: i64 = parse_field(exptime)
         .map_err(|_| ParseError::new(ParseErrorKind::BadFormat).with_discard(len + 2))?;
 
-    let cas = if op == StoreOp::Cas {
-        match tokenizer.next() {
+    let op = match op {
+        Some(op) => op,
+        None => match tokenizer.next() {
             Some(cas_token) => {
-                Some(parse_field::<u64>(cas_token).map_err(|_| {
+                StoreOp::Cas(parse_field::<u64>(cas_token).map_err(|_| {
                     ParseError::new(ParseErrorKind::BadFormat).with_discard(len + 2)
                 })?)
             }
             None => return Err(ParseError::new(ParseErrorKind::BadFormat).with_discard(len + 2)),
-        }
-    } else {
-        None
+        },
     };
 
     let noreply = parse_noreply(tokenizer).map_err(|e| e.with_discard(len + 2))?;
@@ -292,7 +292,6 @@ fn parse_store(op: StoreOp, tokenizer: &mut Tokenizer) -> Result<CommandHeader, 
         flags,
         exptime,
         len,
-        cas,
         noreply,
     }))
 }
@@ -646,7 +645,6 @@ mod tests {
         assert_eq!(pending.flags, 42);
         assert_eq!(pending.exptime, 0);
         assert_eq!(pending.len, 5);
-        assert_eq!(pending.cas, None);
         assert!(!pending.noreply);
     }
 
@@ -750,8 +748,7 @@ mod tests {
     fn cas_with_valid_token_parses_correctly() {
         let pending = expect_store("cas foo 0 0 5 8");
 
-        assert!(matches!(pending.op, StoreOp::Cas));
-        assert_eq!(pending.cas, Some(8));
+        assert_eq!(pending.op, StoreOp::Cas(8));
     }
 
     #[test]

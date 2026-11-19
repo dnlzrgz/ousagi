@@ -11,27 +11,17 @@ use crate::{
 
 const MAX_LINE_LEN: u64 = 8 * 1024; // bytes
 
+/// `LineTooLong` and `BadChunk` are client errors, the connection should survive.
 #[derive(Debug)]
-pub enum ReadLineError {
+pub enum ReadError {
     Io(io::Error),
-    TooLong,
-}
-
-impl From<io::Error> for ReadLineError {
-    fn from(e: io::Error) -> Self {
-        ReadLineError::Io(e)
-    }
-}
-
-#[derive(Debug)]
-pub enum PayloadError {
-    Io(io::Error),
+    LineTooLong,
     BadChunk,
 }
 
-impl From<io::Error> for PayloadError {
+impl From<io::Error> for ReadError {
     fn from(e: io::Error) -> Self {
-        PayloadError::Io(e)
+        ReadError::Io(e)
     }
 }
 
@@ -50,7 +40,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
         }
     }
 
-    pub async fn read_line(&mut self) -> Result<Option<Bytes>, ReadLineError> {
+    pub async fn read_line(&mut self) -> Result<Option<Bytes>, ReadError> {
         loop {
             if let Some(pos) = memchr::memchr(b'\n', &self.buffer) {
                 let mut line = self.buffer.split_to(pos + 1).freeze();
@@ -63,7 +53,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
             }
 
             if self.buffer.len() as u64 >= MAX_LINE_LEN {
-                return Err(ReadLineError::TooLong);
+                return Err(ReadError::LineTooLong);
             }
 
             if self.fill_buffer().await? == 0 {
@@ -72,7 +62,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
         }
     }
 
-    pub async fn read_payload(&mut self, len: usize) -> Result<Bytes, PayloadError> {
+    pub async fn read_payload(&mut self, len: usize) -> Result<Bytes, ReadError> {
         let mut data = BytesMut::with_capacity(len);
 
         let from_buffer = self.buffer.len().min(len);
@@ -84,7 +74,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
             let n = self.reader.read_buf(&mut data).await?;
             stats::BYTES_READ.add(n);
             if n == 0 {
-                return Err(PayloadError::Io(io::Error::new(
+                return Err(ReadError::Io(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "connection closed mid-payload",
                 )));
@@ -93,7 +83,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
 
         while self.buffer.len() < 2 {
             if self.fill_buffer().await? == 0 {
-                return Err(PayloadError::Io(io::Error::new(
+                return Err(ReadError::Io(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "connection closed mid-payload",
                 )));
@@ -103,7 +93,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
         self.buffer.advance(2);
 
         if !crlf_ok {
-            return Err(PayloadError::BadChunk);
+            return Err(ReadError::BadChunk);
         }
 
         Ok(data.freeze())
@@ -114,13 +104,10 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
             let line = match self.read_line().await {
                 Ok(Some(line)) => line,
                 Ok(None) => return Ok(None),
-                Err(ReadLineError::TooLong) => {
-                    self.discard_until_newline().await?;
-                    self.write_response(&Response::ClientError("line too long"))
-                        .await?;
+                Err(e) => {
+                    self.recover(e).await?;
                     continue;
                 }
-                Err(ReadLineError::Io(e)) => return Err(e),
             };
 
             let header = match parse_command_line(&line) {
@@ -139,12 +126,10 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                 CommandHeader::Immediate(cmd) => cmd,
                 CommandHeader::Store(pending) => match self.read_payload(pending.len).await {
                     Ok(data) => pending.into_command(data),
-                    Err(PayloadError::BadChunk) => {
-                        self.write_response(&Response::ClientError("bad data chunk"))
-                            .await?;
+                    Err(e) => {
+                        self.recover(e).await?;
                         continue;
                     }
-                    Err(PayloadError::Io(e)) => return Err(e),
                 },
                 CommandHeader::Quit => {
                     tracing::debug!("quit");
@@ -228,6 +213,18 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
         }
 
         Ok(())
+    }
+
+    async fn recover(&mut self, err: ReadError) -> io::Result<()> {
+        let msg = match err {
+            ReadError::Io(e) => return Err(e),
+            ReadError::LineTooLong => {
+                self.discard_until_newline().await?;
+                "line too long"
+            }
+            ReadError::BadChunk => "bad data chunk",
+        };
+        self.write_response(&Response::ClientError(msg)).await
     }
 
     async fn discard_exact(&mut self, mut n: usize) -> io::Result<()> {

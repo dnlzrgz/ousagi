@@ -5,7 +5,7 @@ use std::sync::{
 
 use bytes::{Bytes, BytesMut};
 use quick_cache::{
-    DefaultHashBuilder, Lifecycle, OptionsBuilder, Weighter,
+    DefaultHashBuilder, Lifecycle, Weighter,
     sync::{Cache, EntryAction, EntryResult},
 };
 
@@ -18,6 +18,11 @@ use crate::{
 
 const THIRTY_DAYS_SECS: i64 = 60 * 60 * 24 * 30;
 const ITEM_OVERHEAD_BYTES: u64 = 64;
+
+fn unexpected_entry() -> Response {
+    tracing::error!("unexpected cache entry result");
+    Response::ServerError("unexpected cache state")
+}
 
 #[derive(Clone)]
 pub struct Item {
@@ -113,12 +118,9 @@ struct StoreInner {
 
 impl StoreInner {
     pub fn new(shared_clock: SharedClock, memory_limit_bytes: u64) -> Self {
-        let items = Cache::with_options(
-            OptionsBuilder::new()
-                .weight_capacity(memory_limit_bytes)
-                .estimated_items_capacity(1000)
-                .build()
-                .unwrap(),
+        let items = Cache::with(
+            1000,
+            memory_limit_bytes,
             ItemWeighter,
             DefaultHashBuilder::default(),
             ItemLifecycle,
@@ -225,7 +227,11 @@ impl Store {
                 EntryResult::Vacant(_) => {
                     stats::TOUCH_MISSES.add(1);
                 }
-                _ => unreachable!(),
+                // Counted as a miss so one key can't throw the entire response.
+                EntryResult::Replaced(..) | EntryResult::Timeout => {
+                    tracing::error!("unexpected cache entry result");
+                    stats::TOUCH_MISSES.add(1);
+                }
             }
         }
 
@@ -240,7 +246,7 @@ impl Store {
             StoreOp::Add => self.store_add(args),
             StoreOp::Replace => self.store_replace(args),
             StoreOp::Append | StoreOp::Prepend => self.store_append_or_prepend(op, args),
-            StoreOp::Cas => self.store_cas(args),
+            StoreOp::Cas(expected_cas) => self.store_cas(expected_cas, args),
         }
     }
 
@@ -283,7 +289,10 @@ impl Store {
                     Response::NotStored
                 }
             }
-            _ => unreachable!(),
+            // Callback never returns `Remove`.
+            EntryResult::Removed(..) | EntryResult::Replaced(..) | EntryResult::Timeout => {
+                unexpected_entry()
+            }
         }
     }
 
@@ -311,7 +320,7 @@ impl Store {
                 Response::NotStored
             }
             EntryResult::Vacant(_) => Response::NotStored,
-            _ => unreachable!(),
+            EntryResult::Replaced(..) | EntryResult::Timeout => unexpected_entry(),
         }
     }
 
@@ -357,16 +366,11 @@ impl Store {
                 Response::NotStored
             }
             EntryResult::Vacant(_) => Response::NotStored,
-            _ => unreachable!(),
+            EntryResult::Replaced(..) | EntryResult::Timeout => unexpected_entry(),
         }
     }
 
-    fn store_cas(&self, args: StoreArgs) -> Response {
-        let Some(expected_cas) = args.cas else {
-            tracing::warn!("received cas command without a cas token");
-            return Response::ServerError("missing cas value");
-        };
-
+    fn store_cas(&self, expected_cas: u64, args: StoreArgs) -> Response {
         let now = self.inner.now();
         let oldest_live = self.inner.oldest_live();
         let cas = self.inner.next_cas();
@@ -404,7 +408,7 @@ impl Store {
                 stats::CAS_MISSES.add(1);
                 Response::NotFound
             }
-            _ => unreachable!(),
+            EntryResult::Replaced(..) | EntryResult::Timeout => unexpected_entry(),
         }
     }
 
@@ -485,7 +489,7 @@ impl Store {
                 misses.add(1);
                 Response::NotFound
             }
-            _ => unreachable!(),
+            EntryResult::Replaced(..) | EntryResult::Timeout => unexpected_entry(),
         }
     }
 
@@ -519,7 +523,7 @@ impl Store {
                 stats::TOUCH_MISSES.add(1);
                 Response::NotFound
             }
-            _ => unreachable!(),
+            EntryResult::Replaced(..) | EntryResult::Timeout => unexpected_entry(),
         }
     }
 
@@ -591,14 +595,13 @@ mod tests {
         Item::new(Bytes::copy_from_slice(data), flags, exptime, cas, TEST_NOW)
     }
 
-    fn store_args(key: &str, flags: u32, exptime: i64, data: &[u8], cas: Option<u64>) -> StoreArgs {
+    fn store_args(key: &str, flags: u32, exptime: i64, data: &[u8]) -> StoreArgs {
         StoreArgs {
             key: Bytes::copy_from_slice(key.as_bytes()),
             flags,
             exptime,
             data: Bytes::copy_from_slice(data),
             noreply: false,
-            cas,
         }
     }
 
@@ -721,7 +724,6 @@ mod tests {
                 exptime: 0,
                 data: Bytes::from_static(b"a"),
                 noreply: false,
-                cas: None,
             },
         );
         store.store(
@@ -732,7 +734,6 @@ mod tests {
                 exptime: 0,
                 data: Bytes::from_static(b"b"),
                 noreply: false,
-                cas: None,
             },
         );
         let resp = store.get(
@@ -820,7 +821,7 @@ mod tests {
     #[test]
     fn add_new_key_stores_it_and_returns_stored() {
         let store = empty_store();
-        let resp = store.store(StoreOp::Add, store_args("foo", 42, 0, b"hello", None));
+        let resp = store.store(StoreOp::Add, store_args("foo", 42, 0, b"hello"));
 
         assert!(matches!(resp, Response::Stored));
 
@@ -832,7 +833,7 @@ mod tests {
     #[test]
     fn add_existing_key_fails_and_returns_not_stored() {
         let store = store_with("foo", mock_item(b"hello", 42, 0, 1));
-        let resp = store.store(StoreOp::Add, store_args("foo", 50, 0, b"jello", None));
+        let resp = store.store(StoreOp::Add, store_args("foo", 50, 0, b"jello"));
 
         assert!(matches!(resp, Response::NotStored));
 
@@ -844,7 +845,7 @@ mod tests {
     #[test]
     fn add_existing_expired_key_overwrites_it_and_returns_stored() {
         let store = store_with("foo", mock_item(b"hello", 42, -1, 1));
-        let resp = store.store(StoreOp::Add, store_args("foo", 50, 0, b"jello", None));
+        let resp = store.store(StoreOp::Add, store_args("foo", 50, 0, b"jello"));
 
         assert!(matches!(resp, Response::Stored));
 
@@ -856,7 +857,7 @@ mod tests {
     #[test]
     fn set_new_key_stores_value() {
         let store = empty_store();
-        let resp = store.store(StoreOp::Set, store_args("foo", 42, 0, b"hello", None));
+        let resp = store.store(StoreOp::Set, store_args("foo", 42, 0, b"hello"));
 
         assert!(matches!(resp, Response::Stored));
 
@@ -868,7 +869,7 @@ mod tests {
     #[test]
     fn set_overwrites_existing_key() {
         let store = store_with("foo", mock_item(b"hello", 42, 0, 1));
-        let resp = store.store(StoreOp::Set, store_args("foo", 50, 0, b"jello", None));
+        let resp = store.store(StoreOp::Set, store_args("foo", 50, 0, b"jello"));
 
         assert!(matches!(resp, Response::Stored));
 
@@ -880,7 +881,7 @@ mod tests {
     #[test]
     fn replace_existing_key_stores_new_value() {
         let store = store_with("foo", mock_item(b"hello", 42, 0, 1));
-        let resp = store.store(StoreOp::Replace, store_args("foo", 50, 0, b"jello", None));
+        let resp = store.store(StoreOp::Replace, store_args("foo", 50, 0, b"jello"));
 
         assert!(matches!(resp, Response::Stored));
 
@@ -892,7 +893,7 @@ mod tests {
     #[test]
     fn replace_missing_key_returns_not_stored() {
         let store = empty_store();
-        let resp = store.store(StoreOp::Replace, store_args("foo", 42, 0, b"hello", None));
+        let resp = store.store(StoreOp::Replace, store_args("foo", 42, 0, b"hello"));
 
         assert!(matches!(resp, Response::NotStored));
         assert!(store.inner.items.get("foo".as_bytes()).is_none());
@@ -901,7 +902,7 @@ mod tests {
     #[test]
     fn replace_expired_key_returns_not_stored() {
         let store = store_with("foo", mock_item(b"hello", 42, -1, 1));
-        let resp = store.store(StoreOp::Replace, store_args("foo", 50, 0, b"jello", None));
+        let resp = store.store(StoreOp::Replace, store_args("foo", 50, 0, b"jello"));
 
         assert!(matches!(resp, Response::NotStored));
         assert!(store.inner.items.get("foo".as_bytes()).is_none());
@@ -912,7 +913,7 @@ mod tests {
         let original = mock_item(b"hello", 42, 100, 1);
         let original_expires_at = original.expires_at();
         let store = store_with("foo", original);
-        let resp = store.store(StoreOp::Append, store_args("foo", 0, 0, b" world", None));
+        let resp = store.store(StoreOp::Append, store_args("foo", 0, 0, b" world"));
 
         assert!(matches!(resp, Response::Stored));
 
@@ -925,7 +926,7 @@ mod tests {
     #[test]
     fn prepend_existing_key_prepends_data() {
         let store = store_with("foo", mock_item(b"world", 42, 0, 1));
-        let resp = store.store(StoreOp::Prepend, store_args("foo", 0, 0, b"hello ", None));
+        let resp = store.store(StoreOp::Prepend, store_args("foo", 0, 0, b"hello "));
 
         assert!(matches!(resp, Response::Stored));
 
@@ -943,7 +944,7 @@ mod tests {
             .insert(Bytes::from_static(b"foo"), mock_item(&full, 0, 0, 1));
 
         for op in [StoreOp::Append, StoreOp::Prepend] {
-            let resp = store.store(op, store_args("foo", 0, 0, b"y", None));
+            let resp = store.store(op, store_args("foo", 0, 0, b"y"));
             assert!(matches!(resp, Response::NotStored));
         }
 
@@ -955,7 +956,7 @@ mod tests {
     #[test]
     fn append_missing_key_returns_not_stored() {
         let store = empty_store();
-        let resp = store.store(StoreOp::Append, store_args("foo", 0, 0, b"hello", None));
+        let resp = store.store(StoreOp::Append, store_args("foo", 0, 0, b"hello"));
 
         assert!(matches!(resp, Response::NotStored));
         assert!(store.inner.items.get("foo".as_bytes()).is_none());
@@ -964,7 +965,7 @@ mod tests {
     #[test]
     fn append_expired_key_returns_not_stored() {
         let store = store_with("foo", mock_item(b"hello", 42, -1, 1));
-        let resp = store.store(StoreOp::Append, store_args("foo", 0, 0, b" world", None));
+        let resp = store.store(StoreOp::Append, store_args("foo", 0, 0, b" world"));
 
         assert!(matches!(resp, Response::NotStored));
         assert!(store.inner.items.get("foo".as_bytes()).is_none());
@@ -973,7 +974,7 @@ mod tests {
     #[test]
     fn cas_matching_token_updates_value_and_returns_stored() {
         let store = store_with("foo", mock_item(b"hello", 42, 0, 7));
-        let resp = store.store(StoreOp::Cas, store_args("foo", 50, 0, b"jello", Some(7)));
+        let resp = store.store(StoreOp::Cas(7), store_args("foo", 50, 0, b"jello"));
 
         assert!(matches!(resp, Response::Stored));
 
@@ -986,7 +987,7 @@ mod tests {
     #[test]
     fn cas_mismatched_token_returns_exists_and_leaves_value_unchanged() {
         let store = store_with("foo", mock_item(b"hello", 42, 0, 7));
-        let resp = store.store(StoreOp::Cas, store_args("foo", 42, 0, b"jello", Some(999)));
+        let resp = store.store(StoreOp::Cas(999), store_args("foo", 42, 0, b"jello"));
 
         assert!(matches!(resp, Response::Exists));
 
@@ -998,7 +999,7 @@ mod tests {
     #[test]
     fn cas_missing_key_returns_not_found() {
         let store = empty_store();
-        let resp = store.store(StoreOp::Cas, store_args("foo", 42, 0, b"hello", Some(1)));
+        let resp = store.store(StoreOp::Cas(1), store_args("foo", 42, 0, b"hello"));
 
         assert!(matches!(resp, Response::NotFound));
     }
@@ -1006,32 +1007,10 @@ mod tests {
     #[test]
     fn cas_expired_key_returns_not_found() {
         let store = store_with("foo", mock_item(b"hello", 42, -1, 7));
-        let resp = store.store(StoreOp::Cas, store_args("foo", 42, 0, b"jello", Some(7)));
+        let resp = store.store(StoreOp::Cas(7), store_args("foo", 42, 0, b"jello"));
 
         assert!(matches!(resp, Response::NotFound));
         assert!(store.inner.items.get("foo".as_bytes()).is_none());
-    }
-
-    #[test]
-    fn cas_without_cas_token_returns_server_error() {
-        let store = store_with("foo", mock_item(b"hello", 42, 0, 7));
-
-        let resp = store.store(
-            StoreOp::Cas,
-            StoreArgs {
-                key: "foo".into(),
-                flags: 42,
-                exptime: 0,
-                data: Bytes::from_static(b"jello"),
-                noreply: false,
-                cas: None, // invalid for Cas
-            },
-        );
-
-        assert!(matches!(resp, Response::ServerError(_)));
-
-        let item = store.inner.items.get("foo".as_bytes()).unwrap();
-        assert_eq!(item.data().as_ref(), b"hello");
     }
 
     #[test]
@@ -1226,7 +1205,7 @@ mod tests {
 
         store.flush(Some(10));
         store.flush(None);
-        store.store(StoreOp::Set, store_args("foo", 0, 0, b"hello", None));
+        store.store(StoreOp::Set, store_args("foo", 0, 0, b"hello"));
         clock.advance(11);
 
         match store.get(&[Bytes::from_static(b"foo")], false) {

@@ -7,7 +7,8 @@ pub enum StoreOp {
     Replace,
     Append,
     Prepend,
-    Cas,
+    /// Carries the token item's current CAS must match.
+    Cas(u64),
 }
 
 #[derive(Debug)]
@@ -17,7 +18,6 @@ pub struct StoreArgs {
     pub exptime: i64,
     pub data: Bytes,
     pub noreply: bool,
-    pub cas: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

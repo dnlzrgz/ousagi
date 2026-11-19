@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::hint::black_box;
 
 use bytes::Bytes;
@@ -9,7 +11,7 @@ use tokio::runtime::Runtime;
 
 #[inline]
 fn rt() -> Runtime {
-    runtime::build(1)
+    runtime::build(1).unwrap()
 }
 
 /// Leaks `bytes` to get a `'static` slice. Doesn't run per-iteration.

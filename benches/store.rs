@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::hint::black_box;
 
 use bytes::Bytes;
@@ -20,7 +22,6 @@ fn populated_store(key: &str, data: &[u8]) -> Store {
             exptime: 0,
             data: Bytes::copy_from_slice(data),
             noreply: false,
-            cas: None,
         },
     );
     store
@@ -58,14 +59,13 @@ fn bench_get_and_touch(c: &mut Criterion) {
     group.finish();
 }
 
-fn store_args(key: &Bytes, data: &'static [u8], cas: Option<u64>) -> StoreArgs {
+fn store_args(key: &Bytes, data: &'static [u8]) -> StoreArgs {
     StoreArgs {
         key: key.clone(),
         flags: 0,
         exptime: 0,
         data: Bytes::from_static(data),
         noreply: false,
-        cas,
     }
 }
 
@@ -76,7 +76,7 @@ fn bench_set(c: &mut Criterion) {
     group.bench_function("set", |b| {
         b.iter_batched_ref(
             empty_store,
-            |store| black_box(store.store(StoreOp::Set, store_args(&key, b"value", None))),
+            |store| black_box(store.store(StoreOp::Set, store_args(&key, b"value"))),
             BatchSize::SmallInput,
         )
     });
@@ -84,7 +84,7 @@ fn bench_set(c: &mut Criterion) {
     group.bench_function("add_new_key", |b| {
         b.iter_batched_ref(
             empty_store,
-            |store| black_box(store.store(StoreOp::Add, store_args(&key, b"value", None))),
+            |store| black_box(store.store(StoreOp::Add, store_args(&key, b"value"))),
             BatchSize::SmallInput,
         )
     });
@@ -92,7 +92,7 @@ fn bench_set(c: &mut Criterion) {
     group.bench_function("append", |b| {
         b.iter_batched_ref(
             || populated_store("foo", b"value"),
-            |store| black_box(store.store(StoreOp::Append, store_args(&key, b" more", None))),
+            |store| black_box(store.store(StoreOp::Append, store_args(&key, b" more"))),
             BatchSize::SmallInput,
         )
     });
@@ -115,7 +115,7 @@ fn bench_cas(c: &mut Criterion) {
                 (store, cas)
             },
             |(store, cas)| {
-                black_box(store.store(StoreOp::Cas, store_args(&key, b"new value", Some(*cas))))
+                black_box(store.store(StoreOp::Cas(*cas), store_args(&key, b"new value")))
             },
             BatchSize::SmallInput,
         )
