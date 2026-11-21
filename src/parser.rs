@@ -5,6 +5,7 @@ use crate::commands::{ArithmeticOp, Command, Response, StoreArgs, StoreOp};
 
 const MAX_KEY_LEN: usize = 250;
 pub(crate) const MAX_ITEM_SIZE: usize = 1024 * 1024; // 1 MiB
+const MAX_DATA_LEN: usize = i32::MAX as usize - 2;
 
 #[derive(Debug)]
 pub enum ParseErrorKind {
@@ -266,9 +267,12 @@ fn parse_store(
         _ => return Err(ParseError::new(ParseErrorKind::Unknown)),
     };
 
-    // u32 like memcached, so `len + 2` below can't overflow
-    let len =
-        parse_field::<u32>(len).map_err(|_| ParseError::new(ParseErrorKind::BadFormat))? as usize;
+    // Bounded like memcached, which also means `len + 2` below can't overflow
+    let len = parse_field::<u32>(len)
+        .ok()
+        .map(|len| len as usize)
+        .filter(|&len| len <= MAX_DATA_LEN)
+        .ok_or_else(|| ParseError::new(ParseErrorKind::BadFormat))?;
 
     validate_key(key)
         .map_err(|_| ParseError::new(ParseErrorKind::BadFormat).with_discard(len + 2))?;
@@ -683,6 +687,24 @@ mod tests {
 
         assert!(matches!(err.kind, ParseErrorKind::BadFormat));
         assert_eq!(err.discard(), Some(MAX_ITEM_SIZE + 1 + 2));
+    }
+
+    #[test]
+    fn set_len_over_i32_max_minus_2_fails_without_discard() {
+        for len in ["2147483646", "2147483647", "3000000000", "4294967295"] {
+            let err = expect_error(&format!("set foo 0 0 {len}"));
+
+            assert!(matches!(err.kind, ParseErrorKind::BadFormat), "{len}");
+            assert_eq!(err.discard(), None, "{len}");
+        }
+    }
+
+    #[test]
+    fn set_len_at_i32_max_minus_2_is_too_large() {
+        match parse_command_line(&line("set foo 0 0 2147483645")).expect("should parse") {
+            CommandHeader::TooLarge(pending) => assert_eq!(pending.len, 2147483645),
+            other => panic!("expected TooLarge header, got {other:?}"),
+        }
     }
 
     #[test]
