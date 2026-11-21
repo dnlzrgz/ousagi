@@ -11,7 +11,6 @@ pub enum ParseErrorKind {
     BadFormat,
     NumericDelta,
     NumericDelay,
-    TooLarge,
     Unknown,
 }
 
@@ -43,7 +42,6 @@ impl ParseError {
             ParseErrorKind::BadFormat => Response::ClientError("bad command line format"),
             ParseErrorKind::NumericDelta => Response::ClientError("invalid numeric delta"),
             ParseErrorKind::NumericDelay => Response::ClientError("invalid numeric delay"),
-            ParseErrorKind::TooLarge => Response::ServerError("object too large for cache"),
             ParseErrorKind::Unknown => Response::Error,
         }
     }
@@ -60,6 +58,14 @@ pub struct PendingStore {
 }
 
 impl PendingStore {
+    pub fn into_too_large(self) -> Command {
+        Command::StoreTooLarge {
+            op: self.op,
+            key: self.key,
+            noreply: self.noreply,
+        }
+    }
+
     pub fn into_command(self, data: Bytes) -> Command {
         Command::Store(
             self.op,
@@ -77,7 +83,10 @@ impl PendingStore {
 #[derive(Debug)]
 pub enum CommandHeader {
     Immediate(Command),
+    /// Read `len` bytes of data, then run the store.
     Store(PendingStore),
+    /// Data block over `MAX_ITEM_SIZE`: discard `len + 2` bytes, then answer.
+    TooLarge(PendingStore),
     Quit,
 }
 
@@ -260,9 +269,6 @@ fn parse_store(
     // u32 like memcached, so `len + 2` below can't overflow
     let len =
         parse_field::<u32>(len).map_err(|_| ParseError::new(ParseErrorKind::BadFormat))? as usize;
-    if len > MAX_ITEM_SIZE {
-        return Err(ParseError::new(ParseErrorKind::TooLarge).with_discard(len + 2));
-    }
 
     validate_key(key)
         .map_err(|_| ParseError::new(ParseErrorKind::BadFormat).with_discard(len + 2))?;
@@ -286,14 +292,19 @@ fn parse_store(
 
     let noreply = parse_noreply(tokenizer).map_err(|e| e.with_discard(len + 2))?;
 
-    Ok(CommandHeader::Store(PendingStore {
+    let pending = PendingStore {
         op,
         key,
         flags,
         exptime,
         len,
         noreply,
-    }))
+    };
+    if len > MAX_ITEM_SIZE {
+        return Ok(CommandHeader::TooLarge(pending));
+    }
+
+    Ok(CommandHeader::Store(pending))
 }
 
 fn parse_delete(tokenizer: &mut Tokenizer) -> Result<CommandHeader, ParseError> {
@@ -649,11 +660,28 @@ mod tests {
     }
 
     #[test]
-    fn set_item_larger_than_max_item_size_fails() {
-        let input = format!("set foo 0 0 {}", MAX_ITEM_SIZE + 1);
+    fn store_larger_than_max_item_size_is_too_large() {
+        for (name, op) in [("set", StoreOp::Set), ("add", StoreOp::Add)] {
+            let input = format!("{name} foo 0 0 {} noreply", MAX_ITEM_SIZE + 1);
+
+            match parse_command_line(&line(&input)).expect("should parse correctly") {
+                CommandHeader::TooLarge(pending) => {
+                    assert_eq!(pending.op, op);
+                    assert_eq!(pending.key, Bytes::from_static(b"foo"));
+                    assert_eq!(pending.len, MAX_ITEM_SIZE + 1);
+                    assert!(pending.noreply);
+                }
+                other => panic!("expected TooLarge header, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn too_large_store_with_invalid_key_is_bad_format() {
+        let input = format!("set fo\x01o 0 0 {}", MAX_ITEM_SIZE + 1);
         let err = expect_error(&input);
 
-        assert!(matches!(err.kind, ParseErrorKind::TooLarge));
+        assert!(matches!(err.kind, ParseErrorKind::BadFormat));
         assert_eq!(err.discard(), Some(MAX_ITEM_SIZE + 1 + 2));
     }
 

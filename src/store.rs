@@ -265,8 +265,7 @@ impl Store {
     }
 
     pub fn store(&self, op: StoreOp, args: StoreArgs) -> Response {
-        stats::CMD_SET.add(1);
-
+        // Not counted in `cmd_set`.
         if item_weight(&args.key, &args.data) > self.inner.max_item_weight {
             tracing::debug!(key = ?args.key, len = args.data.len(), "item heavier than a shard");
             match op {
@@ -283,6 +282,8 @@ impl Store {
             }
         }
 
+        stats::CMD_SET.add(1);
+
         match op {
             StoreOp::Set => self.store_set(args),
             StoreOp::Add => self.store_add(args),
@@ -290,6 +291,14 @@ impl Store {
             StoreOp::Append | StoreOp::Prepend => self.store_append_or_prepend(op, args),
             StoreOp::Cas(expected_cas) => self.store_cas(expected_cas, args),
         }
+    }
+
+    pub fn reject_too_large(&self, op: StoreOp, key: &Bytes) -> Response {
+        if op == StoreOp::Set {
+            self.inner.items.remove(key);
+        }
+
+        Response::ServerError("object too large for cache")
     }
 
     fn store_set(&self, args: StoreArgs) -> Response {
@@ -1434,5 +1443,41 @@ mod tests {
         let evictions = EVICTIONS.value().as_u64();
         assert!(evictions > 0);
         assert_eq!(evictions, 2048 - store.item_count() as u64);
+    }
+
+    #[test]
+    fn too_large_set_removes_old_value() {
+        let store = store_with("foo", mock_item(b"old", 0, 0, 1));
+
+        let resp = store.reject_too_large(StoreOp::Set, &Bytes::from_static(b"foo"));
+
+        assert!(matches!(
+            resp,
+            Response::ServerError("object too large for cache")
+        ));
+        assert!(store.inner.items.get("foo".as_bytes()).is_none());
+    }
+
+    #[test]
+    fn too_large_add_replace_append_prepend_cas_keep_old_value() {
+        let store = store_with("foo", mock_item(b"old", 0, 0, 1));
+        let ops = [
+            StoreOp::Add,
+            StoreOp::Replace,
+            StoreOp::Append,
+            StoreOp::Prepend,
+            StoreOp::Cas(1),
+        ];
+
+        for op in ops {
+            let resp = store.reject_too_large(op, &Bytes::from_static(b"foo"));
+            assert!(matches!(
+                resp,
+                Response::ServerError("object too large for cache")
+            ));
+        }
+
+        let item = store.inner.items.get("foo".as_bytes()).unwrap();
+        assert_eq!(item.data().as_ref(), b"old");
     }
 }

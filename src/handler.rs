@@ -18,6 +18,7 @@ pub fn handle(cmd: Command, store: &Store) -> Response {
             with_cas,
         } => store.get_and_touch(&keys, exptime, with_cas),
         Command::Store(op, args) => store.store(op, args),
+        Command::StoreTooLarge { op, key, .. } => store.reject_too_large(op, &key),
         Command::Delete { key, .. } => store.delete(&key),
         Command::Arithmetic { op, key, delta, .. } => store.arithmetic(op, &key, delta),
         Command::Touch { key, exptime, .. } => store.touch(&key, exptime),

@@ -150,9 +150,13 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
                         continue;
                     }
                 },
+                CommandHeader::TooLarge(pending) => {
+                    self.discard_exact(pending.len + 2).await?;
+                    pending.into_too_large()
+                }
                 CommandHeader::Quit => {
                     tracing::debug!("quit");
-                    // Quit never reaches fill_buffe so the response is flushed here
+                    // Quit never reaches fill_buffer so the response is flushed here
                     self.writer.flush().await?;
                     return Ok(None);
                 }
@@ -339,5 +343,35 @@ mod tests {
         // Per-connection counters: the globals move with other tests running in parallel.
         assert_eq!(conn.bytes_read(), 9);
         assert_eq!(conn.bytes_written(), b"VERSION 1.0\r\n".len() as u64);
+    }
+
+    #[tokio::test]
+    async fn too_large_store_discards_its_data_block() {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let (r, w) = tokio::io::split(server);
+        let mut conn = Connection::new(r, w);
+        let len = crate::parser::MAX_ITEM_SIZE + 1;
+
+        let writer = tokio::spawn(async move {
+            let mut input = format!("set foo 0 0 {len} noreply\r\n").into_bytes();
+            input.extend(std::iter::repeat_n(b'x', len));
+            input.extend_from_slice(b"\r\nversion\r\n");
+            client.write_all(&input).await.unwrap();
+            client
+        });
+
+        match conn.read_command().await.unwrap() {
+            Some(Command::StoreTooLarge { op, key, noreply }) => {
+                assert_eq!(op, crate::commands::StoreOp::Set);
+                assert_eq!(key, Bytes::from_static(b"foo"));
+                assert!(noreply);
+            }
+            other => panic!("expected StoreTooLarge, got {other:?}"),
+        }
+        assert!(matches!(
+            conn.read_command().await.unwrap(),
+            Some(Command::Version)
+        ));
+        writer.await.unwrap();
     }
 }

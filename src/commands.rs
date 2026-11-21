@@ -33,6 +33,11 @@ pub enum Command {
         with_cas: bool,
     },
     Store(StoreOp, StoreArgs),
+    StoreTooLarge {
+        op: StoreOp,
+        key: Bytes,
+        noreply: bool,
+    },
     Delete {
         key: Bytes,
         noreply: bool,
@@ -73,6 +78,7 @@ impl Command {
             Command::Stats => false,
             Command::Version => false,
             Command::Store(_, args) => args.noreply,
+            Command::StoreTooLarge { noreply, .. } => *noreply,
             Command::Delete { noreply, .. }
             | Command::Arithmetic { noreply, .. }
             | Command::Touch { noreply, .. }
