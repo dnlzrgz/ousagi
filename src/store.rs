@@ -4,6 +4,7 @@ use std::sync::{
 };
 
 use bytes::{Bytes, BytesMut};
+use contatori::counters::unsigned::Unsigned;
 use quick_cache::{
     DefaultHashBuilder, Lifecycle, Weighter,
     sync::{Cache, EntryAction, EntryResult},
@@ -106,13 +107,16 @@ fn item_weight(key: &[u8], data: &[u8]) -> u64 {
 }
 
 #[derive(Clone)]
-struct ItemLifecycle;
+struct ItemLifecycle {
+    evictions: &'static Unsigned,
+}
 
 impl Lifecycle<Bytes, Item> for ItemLifecycle {
     type RequestState = ();
 
-    fn on_evict(&self, _state: &mut Self::RequestState, _key: Bytes, _item: Item) {
-        stats::EVICTIONS.add(1);
+    // Runs when an item is evicted.
+    fn before_evict(&self, _state: &mut Self::RequestState, _key: &Bytes, _item: &mut Item) {
+        self.evictions.add(1);
     }
 }
 
@@ -128,14 +132,21 @@ struct StoreInner {
 
 impl StoreInner {
     pub fn new(shared_clock: SharedClock, memory_limit_bytes: u64) -> Self {
+        Self::with_eviction_counter(shared_clock, memory_limit_bytes, &stats::EVICTIONS)
+    }
+
+    fn with_eviction_counter(
+        shared_clock: SharedClock,
+        memory_limit_bytes: u64,
+        evictions: &'static Unsigned,
+    ) -> Self {
         let items = Cache::with(
             1000,
             memory_limit_bytes,
             ItemWeighter,
             DefaultHashBuilder::default(),
-            ItemLifecycle,
+            ItemLifecycle { evictions },
         );
-        // Same rule as quick_cache's shard: `weight > weight_target_hot` is overweight.
         let shard_capacity = items.shard_capacity();
         let max_item_weight = ((shard_capacity as f64 * HOT_ALLOCATION) as u64)
             .clamp(shard_capacity.min(1), shard_capacity);
@@ -592,6 +603,7 @@ impl Store {
 mod tests {
     use super::*;
     use crate::clock::Clock;
+    use contatori::counters::{Observable, unsigned::Unsigned};
 
     const TEST_NOW: u64 = 1_000_000;
     const TEST_MEMORY_LIMIT: u64 = 1024 * 1024;
@@ -1384,5 +1396,43 @@ mod tests {
         );
 
         assert_eq!(get_data(&store, "big"), None);
+    }
+
+    fn store_counting_evictions(counter: &'static Unsigned) -> Store {
+        Store {
+            inner: Arc::new(StoreInner::with_eviction_counter(
+                Clock::mock(TEST_NOW),
+                TEST_MEMORY_LIMIT,
+                counter,
+            )),
+        }
+    }
+
+    #[test]
+    fn overwriting_a_key_is_not_an_eviction() {
+        static EVICTIONS: Unsigned = Unsigned::new();
+        let store = store_counting_evictions(&EVICTIONS);
+
+        for data in [b"a", b"b", b"c"] {
+            store.store(StoreOp::Set, store_args("foo", 0, 0, data));
+        }
+
+        assert_eq!(EVICTIONS.value().as_u64(), 0);
+    }
+
+    #[test]
+    fn evicting_to_make_room_counts_evictions() {
+        static EVICTIONS: Unsigned = Unsigned::new();
+        let store = store_counting_evictions(&EVICTIONS);
+        let data = vec![b'x'; 1024];
+
+        // 2 MiB into a 1 MiB store
+        for i in 0..2048 {
+            store.store(StoreOp::Set, store_args(&format!("key{i}"), 0, 0, &data));
+        }
+
+        let evictions = EVICTIONS.value().as_u64();
+        assert!(evictions > 0);
+        assert_eq!(evictions, 2048 - store.item_count() as u64);
     }
 }
