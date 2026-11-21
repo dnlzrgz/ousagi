@@ -18,6 +18,8 @@ use crate::{
 
 const THIRTY_DAYS_SECS: i64 = 60 * 60 * 24 * 30;
 const ITEM_OVERHEAD_BYTES: u64 = 64;
+/// quick_cache's default `hot_allocation`, used by `Cache::with`.
+const HOT_ALLOCATION: f64 = 0.97;
 
 fn unexpected_entry() -> Response {
     tracing::error!("unexpected cache entry result");
@@ -95,8 +97,12 @@ struct ItemWeighter;
 
 impl Weighter<Bytes, Item> for ItemWeighter {
     fn weight(&self, key: &Bytes, item: &Item) -> u64 {
-        (key.len() + item.data().len()) as u64 + ITEM_OVERHEAD_BYTES
+        item_weight(key, item.data())
     }
+}
+
+fn item_weight(key: &[u8], data: &[u8]) -> u64 {
+    (key.len() + data.len()) as u64 + ITEM_OVERHEAD_BYTES
 }
 
 #[derive(Clone)]
@@ -112,6 +118,9 @@ impl Lifecycle<Bytes, Item> for ItemLifecycle {
 
 struct StoreInner {
     items: Cache<Bytes, Item, ItemWeighter, DefaultHashBuilder, ItemLifecycle>,
+    /// Heaviest item a shard accepts. quick_cache silently drops heavier inserts
+    /// (and the key's old value), so they're refused before reaching it.
+    max_item_weight: u64,
     next_cas: AtomicU64,
     oldest_live: AtomicU64,
     shared_clock: SharedClock,
@@ -126,9 +135,14 @@ impl StoreInner {
             DefaultHashBuilder::default(),
             ItemLifecycle,
         );
+        // Same rule as quick_cache's shard: `weight > weight_target_hot` is overweight.
+        let shard_capacity = items.shard_capacity();
+        let max_item_weight = ((shard_capacity as f64 * HOT_ALLOCATION) as u64)
+            .clamp(shard_capacity.min(1), shard_capacity);
 
         Self {
             items,
+            max_item_weight,
             next_cas: AtomicU64::new(1),
             oldest_live: AtomicU64::new(0),
             shared_clock,
@@ -242,6 +256,22 @@ impl Store {
     pub fn store(&self, op: StoreOp, args: StoreArgs) -> Response {
         stats::CMD_SET.add(1);
 
+        if item_weight(&args.key, &args.data) > self.inner.max_item_weight {
+            tracing::debug!(key = ?args.key, len = args.data.len(), "item heavier than a shard");
+            match op {
+                // Like memcached a failed `set` doesn't leave old value behind
+                StoreOp::Set => {
+                    self.inner.items.remove(&args.key);
+                    return Response::ServerError("out of memory storing object");
+                }
+                StoreOp::Add | StoreOp::Replace | StoreOp::Cas(_) => {
+                    return Response::ServerError("out of memory storing object");
+                }
+                // Combined value is checked by `store_append_or_prepend`
+                StoreOp::Append | StoreOp::Prepend => {}
+            }
+        }
+
         match op {
             StoreOp::Set => self.store_set(args),
             StoreOp::Add => self.store_add(args),
@@ -331,13 +361,16 @@ impl Store {
         let cas = self.inner.next_cas();
         let is_append = op == StoreOp::Append;
 
-        let result = self.inner.items.entry(&args.key, None, |_k, item| {
+        let max_item_weight = self.inner.max_item_weight;
+
+        let result = self.inner.items.entry(&args.key, None, |key, item| {
             if item.is_expired(now, oldest_live) {
                 return EntryAction::Remove;
             }
 
             let new_len = item.data.len() + args.data.len();
-            if new_len > MAX_ITEM_SIZE {
+            let new_weight = item_weight(key, &[]) + new_len as u64;
+            if new_len > MAX_ITEM_SIZE || new_weight > max_item_weight {
                 return EntryAction::Retain(false);
             }
 
@@ -1233,5 +1266,123 @@ mod tests {
             other => panic!("expected Values, got {other:?}"),
         }
         assert!(store.inner.items.get("foo".as_bytes()).is_none());
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    fn big_args(key: &str, data: &[u8]) -> StoreArgs {
+        StoreArgs {
+            key: Bytes::copy_from_slice(key.as_bytes()),
+            flags: 0,
+            exptime: 0,
+            data: Bytes::copy_from_slice(data),
+            noreply: false,
+        }
+    }
+
+    fn get_data(store: &Store, key: &str) -> Option<Bytes> {
+        store
+            .inner
+            .items
+            .get(key.as_bytes())
+            .map(|item| item.data().clone())
+    }
+
+    /// A value which item weighs one byte more than a shard accepts.
+    fn too_heavy(store: &Store, key: &str) -> Vec<u8> {
+        let max = store.inner.max_item_weight;
+        vec![b'x'; (max + 1 - ITEM_OVERHEAD_BYTES) as usize - key.len()]
+    }
+
+    #[test]
+    fn one_mib_item_is_stored_at_64_mib() {
+        let store = Store::new(Clock::mock(1), 64 * MIB);
+        let data = vec![b'x'; MAX_ITEM_SIZE];
+
+        let resp = store.store(StoreOp::Set, big_args("big", &data));
+
+        assert!(matches!(resp, Response::Stored));
+        assert_eq!(
+            get_data(&store, "big").map(|d| d.len()),
+            Some(MAX_ITEM_SIZE)
+        );
+    }
+
+    #[test]
+    fn set_at_max_item_weight_is_stored() {
+        let store = Store::new(Clock::mock(1), MIB);
+        let max = store.inner.max_item_weight;
+        let data = vec![b'x'; (max - ITEM_OVERHEAD_BYTES) as usize - 3];
+
+        let resp = store.store(StoreOp::Set, big_args("big", &data));
+
+        assert!(matches!(resp, Response::Stored));
+        assert_eq!(get_data(&store, "big").map(|d| d.len()), Some(data.len()));
+    }
+
+    #[test]
+    fn set_heavier_than_a_shard_fails_and_drops_old_value() {
+        let store = Store::new(Clock::mock(1), MIB);
+        store.store(StoreOp::Set, big_args("big", b"old"));
+        let data = too_heavy(&store, "big");
+
+        let resp = store.store(StoreOp::Set, big_args("big", &data));
+
+        assert!(matches!(
+            resp,
+            Response::ServerError("out of memory storing object")
+        ));
+        assert_eq!(get_data(&store, "big"), None);
+    }
+
+    #[test]
+    fn add_replace_cas_heavier_than_a_shard_fail_and_keep_old_value() {
+        let store = Store::new(Clock::mock(1), MIB);
+        store.store(StoreOp::Set, big_args("big", b"old"));
+        let cas = store.inner.items.get(b"big".as_slice()).unwrap().cas();
+        let data = too_heavy(&store, "big");
+
+        for op in [StoreOp::Add, StoreOp::Replace, StoreOp::Cas(cas)] {
+            let resp = store.store(op, big_args("big", &data));
+            assert!(
+                matches!(resp, Response::ServerError("out of memory storing object")),
+                "{op:?} answered {resp:?}"
+            );
+        }
+        assert_eq!(get_data(&store, "big").as_deref(), Some(b"old".as_slice()));
+
+        let resp = store.store(StoreOp::Add, big_args("new", &too_heavy(&store, "new")));
+        assert!(matches!(resp, Response::ServerError(_)));
+        assert_eq!(get_data(&store, "new"), None);
+    }
+
+    #[test]
+    fn append_or_prepend_heavier_than_a_shard_returns_not_stored() {
+        let store = Store::new(Clock::mock(1), MIB);
+        store.store(StoreOp::Set, big_args("big", b"old"));
+        let data = too_heavy(&store, "big");
+        let data = &data[3..]; // old + data is one byte too heavy
+
+        for op in [StoreOp::Append, StoreOp::Prepend] {
+            let resp = store.store(op, big_args("big", data));
+            assert!(
+                matches!(resp, Response::NotStored),
+                "{op:?} answered {resp:?}"
+            );
+        }
+        assert_eq!(get_data(&store, "big").as_deref(), Some(b"old".as_slice()));
+    }
+
+    #[test]
+    fn quick_cache_drops_items_just_over_max_item_weight() {
+        let store = Store::new(Clock::mock(1), MIB);
+        let data = too_heavy(&store, "big");
+
+        store.inner.items.insert(
+            Bytes::from_static(b"big"),
+            Item::new(Bytes::from(data), 0, 0, 1, 1),
+        );
+
+        assert_eq!(get_data(&store, "big"), None);
     }
 }
