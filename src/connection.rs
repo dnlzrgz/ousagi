@@ -29,6 +29,8 @@ pub struct Connection<R, W> {
     reader: R,
     writer: BufWriter<W>,
     buffer: BytesMut,
+    bytes_read: u64,
+    bytes_written: u64,
 }
 
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
@@ -37,7 +39,24 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
             reader,
             writer: BufWriter::new(writer),
             buffer: BytesMut::new(),
+            bytes_read: 0,
+            bytes_written: 0,
         }
+    }
+
+    /// Bytes read from the client on the current connection, added to `stats::BYTES_READ` too.
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    /// Bytes written to the client on the current connection, added to `stats::BYTES_WRITTEN` too.
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+
+    fn count_read(&mut self, n: usize) {
+        self.bytes_read += n as u64;
+        stats::BYTES_READ.add(n);
     }
 
     pub async fn read_line(&mut self) -> Result<Option<Bytes>, ReadError> {
@@ -72,7 +91,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
         while data.len() < len {
             self.writer.flush().await?;
             let n = self.reader.read_buf(&mut data).await?;
-            stats::BYTES_READ.add(n);
+            self.count_read(n);
             if n == 0 {
                 return Err(ReadError::Io(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -236,7 +255,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
             self.writer.flush().await?;
             let mut limited = (&mut self.reader).take(n as u64);
             let n = tokio::io::copy(&mut limited, &mut tokio::io::sink()).await?;
-            stats::BYTES_READ.add(n as usize);
+            self.count_read(n as usize);
         }
 
         Ok(())
@@ -251,7 +270,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
 
             self.buffer.clear();
             let n = self.reader.read_buf(&mut self.buffer).await?;
-            stats::BYTES_READ.add(n);
+            self.count_read(n);
             if n == 0 {
                 return Ok(()); // EOF
             }
@@ -262,11 +281,12 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
         self.writer.flush().await?;
         self.buffer.reserve(4096);
         let n = self.reader.read_buf(&mut self.buffer).await?;
-        stats::BYTES_READ.add(n);
+        self.count_read(n);
         Ok(n)
     }
 
     async fn write(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.bytes_written += buf.len() as u64;
         stats::BYTES_WRITTEN.add(buf.len());
         self.writer.write_all(buf).await
     }
@@ -312,10 +332,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(stats::BYTES_READ.value().as_u64() - read_before, 9);
-        assert_eq!(
-            stats::BYTES_WRITTEN.value().as_u64() - written_before,
-            b"VERSION 1.0\r\n".len() as u64
-        );
+        // The globals only grow, other tests may add to them too.
+        assert!(stats::BYTES_READ.value().as_u64() - read_before >= 9);
+        assert!(stats::BYTES_WRITTEN.value().as_u64() - written_before >= 13);
+
+        // Per-connection counters: the globals move with other tests running in parallel.
+        assert_eq!(conn.bytes_read(), 9);
+        assert_eq!(conn.bytes_written(), b"VERSION 1.0\r\n".len() as u64);
     }
 }
