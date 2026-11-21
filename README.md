@@ -117,6 +117,7 @@ Some criterion micro-benchmarks (single thread, no network, medians):
 - `stats` has no subcommands (`stats items`, `stats slabs`, ...) and reports a subset of memcached's fields.
 - `verbosity` is accepted but does nothing; logging is set at startup with `-v` or `RUST_LOG`.
 - The value size limit (1 MiB) isn't configurable like memcached's `-I`.
+- Command lines are limited to 8 KiB, except `get`/`gets` lines, which can be up to 4 MiB.
 - When the connection limit is reached, new connections wait for a free slot instead of being refused with an error.
 - There's no idle timeout for connections.
 

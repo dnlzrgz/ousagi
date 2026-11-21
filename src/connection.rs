@@ -10,6 +10,7 @@ use crate::{
 };
 
 const MAX_LINE_LEN: u64 = 8 * 1024; // bytes
+const MAX_MULTIGET_LINE_LEN: u64 = 4 * 1024 * 1024; // bytes
 
 /// `LineTooLong` and `BadChunk` are client errors, the connection should survive.
 #[derive(Debug)]
@@ -60,9 +61,12 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
     }
 
     pub async fn read_line(&mut self) -> Result<Option<Bytes>, ReadError> {
+        // Bytes already searched for `\n`, so we don't need to rescan here.
+        let mut searched = 0;
+
         loop {
-            if let Some(pos) = memchr::memchr(b'\n', &self.buffer) {
-                let mut line = self.buffer.split_to(pos + 1).freeze();
+            if let Some(pos) = memchr::memchr(b'\n', &self.buffer[searched..]) {
+                let mut line = self.buffer.split_to(searched + pos + 1).freeze();
 
                 while matches!(line.last(), Some(b'\n') | Some(b'\r')) {
                     line.truncate(line.len() - 1);
@@ -70,8 +74,10 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
 
                 return Ok(Some(line));
             }
+            searched = self.buffer.len();
 
-            if self.buffer.len() as u64 >= MAX_LINE_LEN {
+            let len = self.buffer.len() as u64;
+            if len >= MAX_LINE_LEN && (len >= MAX_MULTIGET_LINE_LEN || !is_multiget(&self.buffer)) {
                 return Err(ReadError::LineTooLong);
             }
 
@@ -296,6 +302,13 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
     }
 }
 
+/// Whether a partial line is a `get`/`gets`, only lines allowed to surpass `MAX_LINE_LEN`.
+fn is_multiget(line: &[u8]) -> bool {
+    let start = line.iter().position(|&b| b != b' ').unwrap_or(line.len());
+    let line = &line[start..];
+    line.starts_with(b"get ") || line.starts_with(b"gets ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,11 +349,10 @@ mod tests {
             .await
             .unwrap();
 
-        // The globals only grow, other tests may add to them too.
         assert!(stats::BYTES_READ.value().as_u64() - read_before >= 9);
         assert!(stats::BYTES_WRITTEN.value().as_u64() - written_before >= 13);
 
-        // Per-connection counters: the globals move with other tests running in parallel.
+        // Per-connection counters
         assert_eq!(conn.bytes_read(), 9);
         assert_eq!(conn.bytes_written(), b"VERSION 1.0\r\n".len() as u64);
     }
@@ -373,5 +385,82 @@ mod tests {
             Some(Command::Version)
         ));
         writer.await.unwrap();
+    }
+
+    fn connection_with_input(
+        input: Vec<u8>,
+    ) -> Connection<
+        tokio::io::ReadHalf<tokio::io::DuplexStream>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    > {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            client.write_all(&input).await.unwrap();
+            // Keep the client open until the server side is dropped
+            let mut sink = Vec::new();
+            let _ = client.read_to_end(&mut sink).await;
+        });
+        let (r, w) = tokio::io::split(server);
+        Connection::new(r, w)
+    }
+
+    fn multiget_line(cmd: &str, keys: usize) -> Vec<u8> {
+        let mut line = cmd.to_string();
+        for i in 0..keys {
+            line.push_str(&format!(" key{i:07}")); // 11 bytes per key
+        }
+        line.push_str("\r\nversion\r\n");
+        line.into_bytes()
+    }
+
+    #[tokio::test]
+    async fn get_and_gets_lines_longer_than_max_line_len_are_accepted() {
+        for (cmd, cas) in [("get", false), ("gets", true)] {
+            let input = multiget_line(cmd, 3000);
+            assert!(input.len() as u64 > MAX_LINE_LEN);
+            let mut conn = connection_with_input(input);
+
+            match conn.read_command().await.unwrap() {
+                Some(Command::Get { keys, with_cas }) => {
+                    assert_eq!(keys.len(), 3000);
+                    assert_eq!(keys[2999], Bytes::from_static(b"key0002999"));
+                    assert_eq!(with_cas, cas);
+                }
+                other => panic!("expected Get, got {other:?}"),
+            }
+            assert!(matches!(
+                conn.read_command().await.unwrap(),
+                Some(Command::Version)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn other_lines_longer_than_max_line_len_are_rejected() {
+        let mut conn = connection_with_input(multiget_line("gat 0", 3000));
+
+        assert!(matches!(
+            conn.read_command().await.unwrap(),
+            Some(Command::Version)
+        ));
+        assert_eq!(
+            conn.bytes_written(),
+            b"CLIENT_ERROR line too long\r\n".len() as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn get_lines_longer_than_max_multiget_line_len_are_rejected() {
+        let keys = MAX_MULTIGET_LINE_LEN as usize / 11 + 1;
+        let mut conn = connection_with_input(multiget_line("get", keys));
+
+        assert!(matches!(
+            conn.read_command().await.unwrap(),
+            Some(Command::Version)
+        ));
+        assert_eq!(
+            conn.bytes_written(),
+            b"CLIENT_ERROR line too long\r\n".len() as u64
+        );
     }
 }
