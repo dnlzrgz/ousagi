@@ -4,8 +4,9 @@ use std::hint::black_box;
 
 use bytes::Bytes;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use ousagi::commands::Response;
+use ousagi::commands::{Response, Value};
 use ousagi::connection::Connection;
+use ousagi::output::Output;
 use ousagi::runtime;
 use tokio::runtime::Runtime;
 
@@ -149,41 +150,46 @@ fn bench_read_command(c: &mut Criterion) {
     group.finish();
 }
 
+/// Queues responses and sends them like a `Connection` before next read.
 fn bench_write_response(c: &mut Criterion) {
     let rt = rt();
     let mut group = c.benchmark_group("write_response");
 
     group.bench_function("stored", |b| {
         b.to_async(&rt).iter_batched(
-            || setup(b""),
-            |mut conn| async move {
-                conn.write_response(&Response::Stored).await.unwrap();
-                conn.write_response(&Response::Stored).await.unwrap();
-                conn
+            || (Output::default(), Vec::with_capacity(64)),
+            |(mut out, mut writer)| async move {
+                out.response(&Response::Stored);
+                out.response(&Response::Stored);
+                out.write_to(&mut writer).await.unwrap();
+                (out, writer)
             },
             BatchSize::SmallInput,
         );
     });
 
     for &n in &[1usize, 10, 100] {
-        let values: Vec<_> = (0..n)
-            .map(|i| {
-                (
-                    Bytes::from(format!("key:{i}")),
-                    0u32,
-                    Bytes::from_static(b"a value stored in the cache"),
-                    None,
-                )
-            })
-            .collect();
-        let resp = Response::Values(values);
+        let keys: Vec<_> = (0..n).map(|i| format!("key:{i}").into_bytes()).collect();
+        let data = Bytes::from_static(b"a value stored in the cache");
 
-        group.bench_with_input(BenchmarkId::new("values", n), &resp, |b, resp| {
+        group.bench_with_input(BenchmarkId::new("values", n), &keys, |b, keys| {
             b.to_async(&rt).iter_batched(
-                || setup(b""),
-                |mut conn| async move {
-                    conn.write_response(resp).await.unwrap();
-                    conn
+                || (Output::default(), Vec::with_capacity(64)),
+                |(mut out, mut writer)| {
+                    let data = &data;
+                    async move {
+                        for key in keys {
+                            out.value(Value {
+                                key,
+                                flags: 0,
+                                data,
+                                cas: None,
+                            });
+                        }
+                        out.response(&Response::End);
+                        out.write_to(&mut writer).await.unwrap();
+                        (out, writer)
+                    }
                 },
                 BatchSize::SmallInput,
             );

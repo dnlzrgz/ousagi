@@ -9,11 +9,7 @@ pub async fn process(mut socket: TcpStream, store: Store) -> io::Result<()> {
     let mut conn = Connection::new(r, w);
 
     while let Some(cmd) = conn.read_command().await? {
-        let noreply = cmd.noreply();
-        let resp = handler::handle(cmd, &store);
-        if !noreply {
-            conn.write_response(&resp).await?;
-        }
+        handler::handle(cmd, &store, conn.output());
     }
 
     Ok(())

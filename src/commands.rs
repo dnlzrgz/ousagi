@@ -88,7 +88,18 @@ impl Command {
     }
 }
 
-/// Response written back to the client for a given `Command`.
+/// Single item in a `get`/`gets`/`gat`/`gats` response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Value<'a> {
+    pub key: &'a [u8],
+    pub flags: u32,
+    pub data: &'a Bytes,
+    /// Only for `gets`/`gats`.
+    pub cas: Option<u64>,
+}
+
+/// Response written back to the client for a given `Command`. Values and
+/// stats are encoded one by one (`Output::value`, `Output::stat`) before `End`.
 #[derive(Debug)]
 pub enum Response {
     Stored,
@@ -97,12 +108,11 @@ pub enum Response {
     NotFound,
     Exists,
     Touched,
-    Values(Vec<(Bytes, u32, Bytes, Option<u64>)>),
+    End,
     Number(u64),
     Ok,
     Version(&'static str),
     Error,
     ClientError(&'static str),
     ServerError(&'static str),
-    Stats(Vec<(&'static str, String)>),
 }

@@ -101,7 +101,7 @@ Some criterion micro-benchmarks (single thread, no network, medians):
 
 **Streaming parser over a reusable buffer.** Each connection reads into one `BytesMut`, finds the end of the line with `memchr`, and tokenizes it in place. Storage commands only parse their header; the data block is read separately into a buffer of the exact size, so the parser never touches value bytes. Lookup keys are zero-copy slices of the line, while keys that end up in the cache are copied, so a cached item doesn't keep a whole read buffer alive. When a storage command is rejected, its data block is still read and discarded so the connection stays in sync.
 
-**Flush when idle, not per response.** Responses go into a `BufWriter` that is only flushed right before the connection blocks on a read. A client that pipelines 100 commands gets its responses back in a few large writes instead of 100 small ones.
+**Flush when idle, not per response.** Responses are encoded into an output buffer that is sent right before the connection blocks on a read. A client that pipelines 100 commands gets its responses back in a few large writes instead of 100 small ones. `get` hits are encoded straight from the cache into the buffer; values too big to copy are queued by reference instead.
 
 **quick_cache for storage and eviction.** Items live in a sharded, weighted [quick_cache](https://github.com/arthurprs/quick-cache), which evicts with an S3-FIFO-style policy. Each item weighs its key plus its value plus 64 bytes, so `-m` bounds memory approximately rather than exactly. `get` only takes a shard read lock. Commands that read and then write (`add`, `cas`, `incr`, `append`, ...) run under the shard's write lock, so they're atomic per key.
 

@@ -5,7 +5,7 @@ use std::hint::black_box;
 use bytes::Bytes;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use ousagi::clock::Clock;
-use ousagi::commands::{ArithmeticOp, Response, StoreArgs, StoreOp};
+use ousagi::commands::{ArithmeticOp, StoreArgs, StoreOp};
 use ousagi::store::Store;
 
 fn empty_store() -> Store {
@@ -33,12 +33,12 @@ fn bench_get(c: &mut Criterion) {
 
     let hit_store = populated_store("foo", b"a value stored in the cache");
     group.bench_function("hit", |b| {
-        b.iter(|| black_box(hit_store.get(black_box(&key), false)))
+        b.iter(|| hit_store.get(black_box(&key), false, |value| _ = black_box(value)))
     });
 
     let miss_store = empty_store();
     group.bench_function("miss", |b| {
-        b.iter(|| black_box(miss_store.get(black_box(&key), false)))
+        b.iter(|| miss_store.get(black_box(&key), false, |value| _ = black_box(value)))
     });
 
     group.finish();
@@ -51,7 +51,7 @@ fn bench_get_and_touch(c: &mut Criterion) {
     group.bench_function("hit", |b| {
         b.iter_batched_ref(
             || populated_store("foo", b"a value stored in the cache"),
-            |store| black_box(store.get_and_touch(black_box(&key), 100, false)),
+            |store| store.get_and_touch(black_box(&key), 100, false, |value| _ = black_box(value)),
             BatchSize::SmallInput,
         )
     });
@@ -108,10 +108,9 @@ fn bench_cas(c: &mut Criterion) {
         b.iter_batched_ref(
             || {
                 let store = populated_store("foo", b"value");
-                let cas = match store.get(std::slice::from_ref(&key), true) {
-                    Response::Values(values) => values[0].3.expect("cas token"),
-                    other => panic!("expected Values, got {other:?}"),
-                };
+                let mut cas = None;
+                store.get(std::slice::from_ref(&key), true, |value| cas = value.cas);
+                let cas = cas.expect("cas token");
                 (store, cas)
             },
             |(store, cas)| {

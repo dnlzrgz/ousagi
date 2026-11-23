@@ -12,7 +12,7 @@ use quick_cache::{
 
 use crate::{
     clock::{Clock, SharedClock},
-    commands::{ArithmeticOp, Response, StoreArgs, StoreOp},
+    commands::{ArithmeticOp, Response, StoreArgs, StoreOp, Value},
     parser::MAX_ITEM_SIZE,
     stats,
 };
@@ -193,19 +193,22 @@ impl Store {
         }
     }
 
-    pub fn get(&self, keys: &[Bytes], with_cas: bool) -> Response {
+    pub fn get(&self, keys: &[Bytes], with_cas: bool, mut on_hit: impl FnMut(Value<'_>)) {
         let now = self.inner.now();
         stats::CMD_GET.add(keys.len());
 
         let oldest_live = self.inner.oldest_live();
-        let mut values = Vec::with_capacity(keys.len());
 
         for key in keys {
             match self.inner.items.get(key) {
                 Some(item) if !item.is_expired(now, oldest_live) => {
                     stats::GET_HITS.add(1);
-                    let cas = with_cas.then_some(item.cas());
-                    values.push((key.clone(), item.flags(), item.data, cas));
+                    on_hit(Value {
+                        key,
+                        flags: item.flags(),
+                        data: item.data(),
+                        cas: with_cas.then_some(item.cas()),
+                    });
                 }
                 Some(_) => {
                     self.inner
@@ -219,16 +222,19 @@ impl Store {
                 }
             }
         }
-
-        Response::Values(values)
     }
 
-    pub fn get_and_touch(&self, keys: &[Bytes], exptime: i64, with_cas: bool) -> Response {
+    pub fn get_and_touch(
+        &self,
+        keys: &[Bytes],
+        exptime: i64,
+        with_cas: bool,
+        mut on_hit: impl FnMut(Value<'_>),
+    ) {
         let now = self.inner.now();
         stats::CMD_TOUCH.add(keys.len());
 
         let oldest_live = self.inner.oldest_live();
-        let mut values = Vec::with_capacity(keys.len());
 
         for key in keys {
             let result = self.inner.items.entry(key, None, |_key, item| {
@@ -244,7 +250,12 @@ impl Store {
             match result {
                 EntryResult::Retained((flags, data, cas)) => {
                     stats::TOUCH_HITS.add(1);
-                    values.push((key.clone(), flags, data, with_cas.then_some(cas)));
+                    on_hit(Value {
+                        key,
+                        flags,
+                        data: &data,
+                        cas: with_cas.then_some(cas),
+                    });
                 }
                 EntryResult::Removed(..) => {
                     stats::GET_EXPIRED.add(1);
@@ -260,8 +271,6 @@ impl Store {
                 }
             }
         }
-
-        Response::Values(values)
     }
 
     pub fn store(&self, op: StoreOp, args: StoreArgs) -> Response {
@@ -617,6 +626,29 @@ mod tests {
     const TEST_NOW: u64 = 1_000_000;
     const TEST_MEMORY_LIMIT: u64 = 1024 * 1024;
 
+    type Hit = (Bytes, u32, Bytes, Option<u64>);
+
+    fn hit(value: Value<'_>) -> Hit {
+        (
+            Bytes::copy_from_slice(value.key),
+            value.flags,
+            value.data.clone(),
+            value.cas,
+        )
+    }
+
+    fn get(store: &Store, keys: &[Bytes], with_cas: bool) -> Vec<Hit> {
+        let mut hits = Vec::new();
+        store.get(keys, with_cas, |value| hits.push(hit(value)));
+        hits
+    }
+
+    fn get_and_touch(store: &Store, keys: &[Bytes], exptime: i64, with_cas: bool) -> Vec<Hit> {
+        let mut hits = Vec::new();
+        store.get_and_touch(keys, exptime, with_cas, |value| hits.push(hit(value)));
+        hits
+    }
+
     fn item_at(secs_from_now: i64, now: u64) -> Item {
         Item::new(Bytes::from_static(b"data"), 0, secs_from_now, 1, now)
     }
@@ -742,30 +774,21 @@ mod tests {
     #[test]
     fn get_existing_key_returns_value_with_correct_flag_and_data() {
         let store = store_with("foo", mock_item(b"hello", 42, 0, 1));
-        let resp = store.get(&[Bytes::from_static(b"foo")], false);
+        let values = get(&store, &[Bytes::from_static(b"foo")], false);
 
-        match resp {
-            Response::Values(values) => {
-                assert_eq!(values.len(), 1);
-                let (key, flags, data, cas) = &values[0];
-                assert_eq!(key, &Bytes::from_static(b"foo"));
-                assert_eq!(*flags, 42);
-                assert_eq!(data, &Bytes::from_static(b"hello"));
-                assert_eq!(*cas, None);
-            }
-            other => panic!("expected Values, got {other:?}"),
-        }
+        assert_eq!(values.len(), 1);
+        let (key, flags, data, cas) = &values[0];
+        assert_eq!(key, &Bytes::from_static(b"foo"));
+        assert_eq!(*flags, 42);
+        assert_eq!(data, &Bytes::from_static(b"hello"));
+        assert_eq!(*cas, None);
     }
 
     #[test]
     fn get_missing_key_returns_empty_values() {
         let store = store_with("foo", mock_item(b"hello", 42, 0, 1));
-        let resp = store.get(&[Bytes::from_static(b"bar")], false);
-
-        match resp {
-            Response::Values(values) => assert!(values.is_empty()),
-            other => panic!("expected Values, got {other:?}"),
-        }
+        let values = get(&store, &[Bytes::from_static(b"bar")], false);
+        assert!(values.is_empty());
     }
 
     #[test]
@@ -791,40 +814,30 @@ mod tests {
                 noreply: false,
             },
         );
-        let resp = store.get(
+        let values = get(
+            &store,
             &[Bytes::from_static(b"foo"), Bytes::from_static(b"bar")],
             false,
         );
-
-        match resp {
-            Response::Values(values) => assert_eq!(values.len(), 2),
-            other => panic!("expected Values, got {other:?}"),
-        }
+        assert_eq!(values.len(), 2);
     }
 
     #[test]
     fn get_multiple_keys_skips_missing_one() {
         let store = store_with("foo", mock_item(b"hello", 42, 0, 1));
-        let resp = store.get(
+        let values = get(
+            &store,
             &[Bytes::from_static(b"foo"), Bytes::from_static(b"bar")],
             false,
         );
-
-        match resp {
-            Response::Values(values) => assert_eq!(values.len(), 1),
-            other => panic!("expected Values, got {other:?}"),
-        }
+        assert_eq!(values.len(), 1);
     }
 
     #[test]
     fn get_expired_key_is_treated_as_missing_and_lazily_removed() {
         let store = store_with("foo", mock_item(b"hello", 42, -1, 1));
-        let resp = store.get(&[Bytes::from_static(b"foo")], false);
-
-        match resp {
-            Response::Values(values) => assert!(values.is_empty()),
-            other => panic!("expected Values, got {other:?}"),
-        }
+        let values = get(&store, &[Bytes::from_static(b"foo")], false);
+        assert!(values.is_empty());
 
         assert!(store.inner.items.get("foo".as_bytes()).is_none());
     }
@@ -833,19 +846,14 @@ mod tests {
     fn gat_hit_updates_expiry_and_returns_value() {
         let store = store_with("foo", mock_item(b"hello", 42, 0, 999));
 
-        let resp = store.get_and_touch(&[Bytes::from_static(b"foo")], 100, false);
+        let values = get_and_touch(&store, &[Bytes::from_static(b"foo")], 100, false);
 
-        match resp {
-            Response::Values(values) => {
-                assert_eq!(values.len(), 1);
-                let (key, flags, data, cas) = &values[0];
-                assert_eq!(key, &Bytes::from_static(b"foo"));
-                assert_eq!(*flags, 42);
-                assert_eq!(data, &Bytes::from_static(b"hello"));
-                assert_eq!(*cas, None); // with_cas was false
-            }
-            other => panic!("expected Values, got {other:?}"),
-        }
+        assert_eq!(values.len(), 1);
+        let (key, flags, data, cas) = &values[0];
+        assert_eq!(key, &Bytes::from_static(b"foo"));
+        assert_eq!(*flags, 42);
+        assert_eq!(data, &Bytes::from_static(b"hello"));
+        assert_eq!(*cas, None); // with_cas was false
 
         let item = store
             .inner
@@ -859,15 +867,10 @@ mod tests {
     fn gat_hit_with_cas_keeps_cas_token() {
         let store = store_with("foo", mock_item(b"hello", 42, 0, 999));
 
-        let resp = store.get_and_touch(&[Bytes::from_static(b"foo")], 100, true);
+        let values = get_and_touch(&store, &[Bytes::from_static(b"foo")], 100, true);
 
-        match resp {
-            Response::Values(values) => {
-                let (_, _, _, cas) = &values[0];
-                assert_eq!(*cas, Some(999));
-            }
-            other => panic!("expected Values, got {other:?}"),
-        }
+        let (_, _, _, cas) = &values[0];
+        assert_eq!(*cas, Some(999));
 
         let item = store.inner.items.get("foo".as_bytes()).unwrap();
         assert_eq!(item.cas(), 999);
@@ -1263,10 +1266,7 @@ mod tests {
         store.store(StoreOp::Set, store_args("foo", 0, 0, b"hello"));
         clock.advance(11);
 
-        match store.get(&[Bytes::from_static(b"foo")], false) {
-            Response::Values(values) => assert_eq!(values.len(), 1),
-            other => panic!("expected Values, got {other:?}"),
-        }
+        assert_eq!(get(&store, &[Bytes::from_static(b"foo")], false).len(), 1);
         assert_eq!(store.inner.oldest_live(), None);
     }
 
@@ -1275,17 +1275,11 @@ mod tests {
         let (store, clock) = store_with_clock("foo", mock_item(b"hello", 42, 0, 1));
         store.flush(Some(10));
 
-        match store.get(&[Bytes::from_static(b"foo")], false) {
-            Response::Values(values) => assert_eq!(values.len(), 1), // not expired yet
-            other => panic!("expected Values, got {other:?}"),
-        }
+        assert_eq!(get(&store, &[Bytes::from_static(b"foo")], false).len(), 1); // not expired yet
 
         clock.advance(11);
 
-        match store.get(&[Bytes::from_static(b"foo")], false) {
-            Response::Values(values) => assert!(values.is_empty()),
-            other => panic!("expected Values, got {other:?}"),
-        }
+        assert!(get(&store, &[Bytes::from_static(b"foo")], false).is_empty());
         assert!(store.inner.items.get("foo".as_bytes()).is_none());
     }
 

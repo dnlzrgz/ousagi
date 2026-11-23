@@ -3,6 +3,7 @@ pub mod clock;
 pub mod commands;
 pub mod connection;
 pub mod handler;
+pub mod output;
 pub mod parser;
 pub mod runtime;
 pub mod server;
