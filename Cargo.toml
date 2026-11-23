@@ -33,7 +33,7 @@ memchr = "2.8.3"
 quick_cache = "0.7.0"
 thread_local = "1.1.10"
 tokio = { version = "1.53.1", features = ["full"] }
-tracing = "0.1.44"
+tracing = { version = "0.1.44", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]

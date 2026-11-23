@@ -61,7 +61,7 @@ DELETED
 | `-t, --threads` | `4` | Worker threads (`1` uses a single-threaded runtime) |
 | `-c, --max-connections` | `1024` | Max simultaneous client connections |
 | `-m, --memory-limit-mb` | `64` | Memory for cached items, in megabytes |
-| `-v, --verbose` | `warn` | `-v` info, `-vv` debug, `-vvv` trace. `RUST_LOG` overrides it |
+| `-v, --verbose` | `warn` | `-v` info, `-vv` debug, `-vvv` trace. `RUST_LOG` overrides it. |
 
 There is also a Docker image:
 

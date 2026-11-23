@@ -1,5 +1,3 @@
-use tracing::{Level, instrument};
-
 use crate::{
     commands::{Command, Response},
     output::Output,
@@ -9,7 +7,6 @@ use crate::{
 
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[instrument(skip(store, out), level = Level::DEBUG)]
 pub fn handle(cmd: Command, store: &Store, out: &mut Output) {
     let noreply = cmd.noreply();
     let resp = match cmd {

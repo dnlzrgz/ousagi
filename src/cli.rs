@@ -24,7 +24,7 @@ pub struct Cli {
     #[arg(short = 'm', long, default_value_t = 64, value_parser = clap::value_parser!(u64).range(..=u64::MAX >> 20))]
     pub memory_limit_mb: u64,
 
-    /// Verbosity level (-v, -vv, -vvv)
+    /// Verbosity level (-v, -vv, -vvv).
     #[arg(short = 'v', long="verbose", action = ArgAction::Count)]
     pub verbose: u8,
 }
