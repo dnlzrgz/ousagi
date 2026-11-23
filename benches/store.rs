@@ -8,8 +8,11 @@ use ousagi::clock::Clock;
 use ousagi::commands::{ArithmeticOp, StoreArgs, StoreOp};
 use ousagi::store::Store;
 
+/// The server's default `-m 64`, so the cache gets the same shard count as in production.
+const MEMORY_LIMIT: u64 = 64 * 1024 * 1024;
+
 fn empty_store() -> Store {
-    Store::new(Clock::mock(1_000_000), 1024 * 1024)
+    Store::new(Clock::mock(1_000_000), MEMORY_LIMIT).unwrap()
 }
 
 fn populated_store(key: &str, data: &[u8]) -> Store {

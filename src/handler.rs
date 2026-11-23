@@ -54,7 +54,7 @@ mod tests {
     };
 
     fn store() -> Store {
-        Store::new(Clock::mock(1_000_000), 1024 * 1024)
+        Store::new(Clock::mock(1_000_000), 1024 * 1024).unwrap()
     }
 
     fn set(key: &str, data: &str, noreply: bool) -> Command {

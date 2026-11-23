@@ -20,7 +20,7 @@ pub async fn run(args: Cli) -> io::Result<()> {
     tracing::info!(addr = %addr, threads = args.threads, "listening");
 
     let shared_clock = spawn_clock();
-    let store: Store = Store::new(shared_clock, args.memory_limit_mb * 1024 * 1024);
+    let store = Store::new(shared_clock, args.memory_limit_mb * 1024 * 1024)?;
     let connections = Arc::new(Semaphore::new(args.max_connections));
 
     tokio::select! {

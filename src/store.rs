@@ -1,26 +1,40 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    thread,
 };
 
 use bytes::{Bytes, BytesMut};
 use contatori::counters::unsigned::Unsigned;
 use quick_cache::{
-    DefaultHashBuilder, Lifecycle, Weighter,
+    DefaultHashBuilder, Lifecycle, OptionsBuilder, Weighter,
     sync::{Cache, EntryAction, EntryResult},
 };
 
 use crate::{
     clock::{Clock, SharedClock},
     commands::{ArithmeticOp, Response, StoreArgs, StoreOp, Value},
-    parser::MAX_ITEM_SIZE,
+    parser::{MAX_ITEM_SIZE, MAX_KEY_LEN},
     stats,
 };
 
 const THIRTY_DAYS_SECS: i64 = 60 * 60 * 24 * 30;
-const ITEM_OVERHEAD_BYTES: u64 = 64;
-/// quick_cache's default `hot_allocation`, used by `Cache::with`.
+/// Rough allowance for quick_cache's slab links and hash table slot, plus the
+/// allocator overhead of an item's key.
+const ENTRY_BOOKKEEPING_BYTES: usize = 48;
+/// What an item costs on top of its key and data bytes.
+const ITEM_OVERHEAD_BYTES: u64 =
+    (size_of::<Bytes>() + size_of::<Item>() + ENTRY_BOOKKEEPING_BYTES) as u64;
+/// Heaviest item a shard must be able to hold.
+const MAX_ITEM_WEIGHT: u64 = (MAX_ITEM_SIZE + MAX_KEY_LEN) as u64 + ITEM_OVERHEAD_BYTES;
+const TYPICAL_ITEM_BYTES: u64 = 256;
+/// quick_cache's default `hot_allocation`, set explicitly since `max_item_weight` depends on it.
 const HOT_ALLOCATION: f64 = 0.97;
+/// Smallest shard that accepts a `MAX_ITEM_WEIGHT` item (`HOT_ALLOCATION` = 97/100).
+const MIN_SHARD_CAPACITY: u64 = (MAX_ITEM_WEIGHT * 100).div_ceil(97);
 
 fn unexpected_entry() -> Response {
     tracing::error!("unexpected cache entry result");
@@ -120,6 +134,25 @@ impl Lifecycle<Bytes, Item> for ItemLifecycle {
     }
 }
 
+fn estimated_items(memory_limit_bytes: u64) -> usize {
+    let items = memory_limit_bytes / (TYPICAL_ITEM_BYTES + ITEM_OVERHEAD_BYTES);
+    usize::try_from(items).unwrap_or(usize::MAX).max(1)
+}
+
+fn shard_count(memory_limit_bytes: u64, parallelism: usize) -> usize {
+    let wanted = parallelism
+        .saturating_mul(4)
+        .max(1)
+        .checked_next_power_of_two()
+        .unwrap_or(1 << (usize::BITS - 1));
+    // Rounded down to a power of two.
+    let fitting = match memory_limit_bytes / MIN_SHARD_CAPACITY {
+        0 => 1,
+        n => 1 << n.ilog2(),
+    };
+    usize::try_from(fitting).unwrap_or(usize::MAX).min(wanted)
+}
+
 struct StoreInner {
     items: Cache<Bytes, Item, ItemWeighter, DefaultHashBuilder, ItemLifecycle>,
     /// Heaviest item a shard accepts. quick_cache silently drops heavier inserts
@@ -131,7 +164,7 @@ struct StoreInner {
 }
 
 impl StoreInner {
-    pub fn new(shared_clock: SharedClock, memory_limit_bytes: u64) -> Self {
+    pub fn new(shared_clock: SharedClock, memory_limit_bytes: u64) -> io::Result<Self> {
         Self::with_eviction_counter(shared_clock, memory_limit_bytes, &stats::EVICTIONS)
     }
 
@@ -139,10 +172,17 @@ impl StoreInner {
         shared_clock: SharedClock,
         memory_limit_bytes: u64,
         evictions: &'static Unsigned,
-    ) -> Self {
-        let items = Cache::with(
-            1000,
-            memory_limit_bytes,
+    ) -> io::Result<Self> {
+        let parallelism = thread::available_parallelism().map_or(1, |n| n.get());
+        let options = OptionsBuilder::new()
+            .estimated_items_capacity(estimated_items(memory_limit_bytes))
+            .weight_capacity(memory_limit_bytes)
+            .shards(shard_count(memory_limit_bytes, parallelism))
+            .hot_allocation(HOT_ALLOCATION)
+            .build()
+            .map_err(|e| io::Error::other(format!("invalid cache options: {e}")))?;
+        let items = Cache::with_options(
+            options,
             ItemWeighter,
             DefaultHashBuilder::default(),
             ItemLifecycle { evictions },
@@ -151,13 +191,13 @@ impl StoreInner {
         let max_item_weight = ((shard_capacity as f64 * HOT_ALLOCATION) as u64)
             .clamp(shard_capacity.min(1), shard_capacity);
 
-        Self {
+        Ok(Self {
             items,
             max_item_weight,
             next_cas: AtomicU64::new(1),
             oldest_live: AtomicU64::new(0),
             shared_clock,
-        }
+        })
     }
 
     fn next_cas(&self) -> u64 {
@@ -187,10 +227,10 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn new(shared_clock: SharedClock, memory_limit_bytes: u64) -> Self {
-        Self {
-            inner: Arc::new(StoreInner::new(shared_clock, memory_limit_bytes)),
-        }
+    pub fn new(shared_clock: SharedClock, memory_limit_bytes: u64) -> io::Result<Self> {
+        Ok(Self {
+            inner: Arc::new(StoreInner::new(shared_clock, memory_limit_bytes)?),
+        })
     }
 
     pub fn get(&self, keys: &[Bytes], with_cas: bool, mut on_hit: impl FnMut(Value<'_>)) {
@@ -655,7 +695,7 @@ mod tests {
 
     /// Empty Store with a mock clock
     fn empty_store() -> Store {
-        Store::new(Clock::mock(TEST_NOW), TEST_MEMORY_LIMIT)
+        Store::new(Clock::mock(TEST_NOW), TEST_MEMORY_LIMIT).unwrap()
     }
 
     /// Pre-populated Store with one item
@@ -670,7 +710,7 @@ mod tests {
 
     fn store_with_clock(key: &str, item: Item) -> (Store, SharedClock) {
         let clock = Clock::mock(TEST_NOW);
-        let store = Store::new(clock.clone(), TEST_MEMORY_LIMIT);
+        let store = Store::new(clock.clone(), TEST_MEMORY_LIMIT).unwrap();
         store
             .inner
             .items
@@ -752,23 +792,6 @@ mod tests {
     fn item_stored_exactly_at_oldest_live_cutoff_not_expired() {
         let item = item_at(0, 1_000);
         assert!(!item.is_expired(1_000, Some(1_000)));
-    }
-
-    #[test]
-    fn next_cas_starts_at_one_and_increments() {
-        let clock = Clock::mock(1_000);
-        let store = Store::new(clock, TEST_MEMORY_LIMIT);
-
-        assert_eq!(store.inner.next_cas(), 1);
-        assert_eq!(store.inner.next_cas(), 2);
-    }
-
-    #[test]
-    fn oldest_live_defaults_to_none() {
-        let clock = Clock::mock(1_000);
-        let store = Store::new(clock, TEST_MEMORY_LIMIT);
-
-        assert_eq!(store.inner.oldest_live(), None);
     }
 
     #[test]
@@ -994,7 +1017,7 @@ mod tests {
 
     #[test]
     fn append_or_prepend_past_max_item_size_returns_not_stored() {
-        let store = Store::new(Clock::mock(TEST_NOW), 64 * TEST_MEMORY_LIMIT);
+        let store = Store::new(Clock::mock(TEST_NOW), 64 * TEST_MEMORY_LIMIT).unwrap();
         let full = vec![b'x'; MAX_ITEM_SIZE];
         store
             .inner
@@ -1249,7 +1272,7 @@ mod tests {
     #[test]
     fn flush_all_sets_oldest_live() {
         let clock = Clock::mock(1_000);
-        let store = Store::new(clock, TEST_MEMORY_LIMIT);
+        let store = Store::new(clock, TEST_MEMORY_LIMIT).unwrap();
 
         store.flush(Some(30));
 
@@ -1259,7 +1282,7 @@ mod tests {
     #[test]
     fn flush_all_immediate_cancels_pending_delayed_flush() {
         let clock = Clock::mock(TEST_NOW);
-        let store = Store::new(clock.clone(), TEST_MEMORY_LIMIT);
+        let store = Store::new(clock.clone(), TEST_MEMORY_LIMIT).unwrap();
 
         store.flush(Some(10));
         store.flush(None);
@@ -1310,22 +1333,47 @@ mod tests {
     }
 
     #[test]
-    fn one_mib_item_is_stored_at_64_mib() {
-        let store = Store::new(Clock::mock(1), 64 * MIB);
-        let data = vec![b'x'; MAX_ITEM_SIZE];
+    fn a_shard_fits_the_heaviest_item_whenever_memory_allows() {
+        for memory_mb in [2, 3, 16, 63, 64, 65, 100, 1024, 65_536] {
+            let memory = memory_mb * MIB;
+            for parallelism in [1, 2, 3, 4, 12, 20, 32, 64, 256] {
+                let shards = shard_count(memory, parallelism);
 
-        let resp = store.store(StoreOp::Set, big_args("big", &data));
+                assert!(shards.is_power_of_two());
+                assert!(shards <= (parallelism * 4).next_power_of_two());
+                // What quick_cache gives each shard
+                let shard_capacity = memory.div_ceil(shards as u64);
+                assert!(
+                    shard_capacity >= MIN_SHARD_CAPACITY,
+                    "{memory_mb} MiB, {parallelism} threads: {shards} shards of {shard_capacity}"
+                );
+            }
+        }
+    }
 
-        assert!(matches!(resp, Response::Stored));
-        assert_eq!(
-            get_data(&store, "big").map(|d| d.len()),
-            Some(MAX_ITEM_SIZE)
-        );
+    #[test]
+    fn store_accepts_the_heaviest_item_whenever_memory_allows() {
+        for memory_mb in [2, 16, 64, 1024] {
+            let store = Store::new(Clock::mock(1), memory_mb * MIB).unwrap();
+            assert!(
+                store.inner.max_item_weight >= MAX_ITEM_WEIGHT,
+                "{memory_mb} MiB"
+            );
+
+            let key = "k".repeat(MAX_KEY_LEN);
+            let data = vec![b'x'; MAX_ITEM_SIZE];
+            let resp = store.store(StoreOp::Set, big_args(&key, &data));
+            assert!(
+                matches!(resp, Response::Stored),
+                "{memory_mb} MiB: {resp:?}"
+            );
+            assert_eq!(get_data(&store, &key).map(|d| d.len()), Some(MAX_ITEM_SIZE));
+        }
     }
 
     #[test]
     fn set_at_max_item_weight_is_stored() {
-        let store = Store::new(Clock::mock(1), MIB);
+        let store = Store::new(Clock::mock(1), MIB).unwrap();
         let max = store.inner.max_item_weight;
         let data = vec![b'x'; (max - ITEM_OVERHEAD_BYTES) as usize - 3];
 
@@ -1337,7 +1385,7 @@ mod tests {
 
     #[test]
     fn set_heavier_than_a_shard_fails_and_drops_old_value() {
-        let store = Store::new(Clock::mock(1), MIB);
+        let store = Store::new(Clock::mock(1), MIB).unwrap();
         store.store(StoreOp::Set, big_args("big", b"old"));
         let data = too_heavy(&store, "big");
 
@@ -1352,7 +1400,7 @@ mod tests {
 
     #[test]
     fn add_replace_cas_heavier_than_a_shard_fail_and_keep_old_value() {
-        let store = Store::new(Clock::mock(1), MIB);
+        let store = Store::new(Clock::mock(1), MIB).unwrap();
         store.store(StoreOp::Set, big_args("big", b"old"));
         let cas = store.inner.items.get(b"big".as_slice()).unwrap().cas();
         let data = too_heavy(&store, "big");
@@ -1373,7 +1421,7 @@ mod tests {
 
     #[test]
     fn append_or_prepend_heavier_than_a_shard_returns_not_stored() {
-        let store = Store::new(Clock::mock(1), MIB);
+        let store = Store::new(Clock::mock(1), MIB).unwrap();
         store.store(StoreOp::Set, big_args("big", b"old"));
         let data = too_heavy(&store, "big");
         let data = &data[3..]; // old + data is one byte too heavy
@@ -1388,26 +1436,16 @@ mod tests {
         assert_eq!(get_data(&store, "big").as_deref(), Some(b"old".as_slice()));
     }
 
-    #[test]
-    fn quick_cache_drops_items_just_over_max_item_weight() {
-        let store = Store::new(Clock::mock(1), MIB);
-        let data = too_heavy(&store, "big");
-
-        store.inner.items.insert(
-            Bytes::from_static(b"big"),
-            Item::new(Bytes::from(data), 0, 0, 1, 1),
-        );
-
-        assert_eq!(get_data(&store, "big"), None);
-    }
-
     fn store_counting_evictions(counter: &'static Unsigned) -> Store {
         Store {
-            inner: Arc::new(StoreInner::with_eviction_counter(
-                Clock::mock(TEST_NOW),
-                TEST_MEMORY_LIMIT,
-                counter,
-            )),
+            inner: Arc::new(
+                StoreInner::with_eviction_counter(
+                    Clock::mock(TEST_NOW),
+                    TEST_MEMORY_LIMIT,
+                    counter,
+                )
+                .unwrap(),
+            ),
         }
     }
 

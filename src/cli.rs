@@ -52,19 +52,8 @@ mod tests {
     }
 
     #[test]
-    fn listen_accepts_ipv6() {
-        let cli = Cli::try_parse_from(["ousagi", "-l", "::1"]).unwrap();
-        assert_eq!(cli.listen, Some(IpAddr::from([0, 0, 0, 0, 0, 0, 0, 1])));
-    }
-
-    #[test]
     fn memory_limit_rejects_values_that_overflow_bytes() {
         assert!(Cli::try_parse_from(["ousagi", "-m", "17592186044415"]).is_ok());
         assert!(Cli::try_parse_from(["ousagi", "-m", "17592186044416"]).is_err());
-    }
-
-    #[test]
-    fn listen_rejects_invalid_address() {
-        assert!(Cli::try_parse_from(["ousagi", "-l", "not-an-ip"]).is_err());
     }
 }

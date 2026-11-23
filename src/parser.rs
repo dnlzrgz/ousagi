@@ -3,7 +3,7 @@ use bytes::Bytes;
 
 use crate::commands::{ArithmeticOp, Command, Response, StoreArgs, StoreOp};
 
-const MAX_KEY_LEN: usize = 250;
+pub(crate) const MAX_KEY_LEN: usize = 250;
 pub(crate) const MAX_ITEM_SIZE: usize = 1024 * 1024; // 1 MiB
 const MAX_DATA_LEN: usize = i32::MAX as usize - 2;
 

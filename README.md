@@ -72,51 +72,55 @@ $ docker run --rm -p 11211:11211 ousagi
 
 ## Performance
 
-memtier_benchmark 2.6.1 against ousagi and memcached 1.6.45, both with 4 threads and in containers limited to 4 CPUs and 1 GiB of memory. Load: 4 memtier threads with 50 clients each, 128-byte values, 100k keys, 1 `set` per 10 `get`s, 30 seconds after warming up the keyspace. Host: 13th Gen Intel Core i7-13650HX (20 threads), Linux. Three runs per server:
+[memtier_benchmark](https://github.com/RedisLabs/memtier_benchmark) 2.6.1 against both servers, each with 4 threads in a container limited to 4 CPUs and 1 GiB:
+
+- 200 clients (4 threads × 50), 128-byte values, 100k keys.
+- 1 `set` per 10 `get`s, for 30 seconds after warming up the keyspace.
+- Intel Core i7-13650HX (20 threads), Linux. Three runs per server, alternating between servers.
 
 | Server | Ops/sec (median) | Range | Avg latency | p99 latency |
 | --- | --- | --- | --- | --- |
-| memcached 1.6.45 | 692k | 691k - 698k | 0.289 ms | 0.727 ms |
-| ousagi | 528k | 506k - 618k | 0.378 ms | 0.791 ms |
+| memcached 1.6.45 | 605k | 601k - 694k | 0.330 ms | 0.895 ms |
+| ousagi | 611k | 562k - 696k | 0.327 ms | 0.783 ms |
 
-So right now ousagi does about 76% of memcached's throughput at the median, and its results vary a lot more from run to run. To reproduce it, run `scripts/bench.sh` and `scripts/bench.sh -t memcached`.
+On this load, ousagi and memcached are about even. To reproduce it, run `scripts/bench.sh` and `scripts/bench.sh -t memcached`.
 
-Some criterion micro-benchmarks (single thread, no network, medians):
+Criterion micro-benchmarks (single thread, no network, medians):
 
 | Benchmark | What it measures | Time |
 | --- | --- | --- |
-| `parse_get/single_key` | parse `get foo` | 26 ns |
-| `parse_store/set` | parse `set foo 0 0 512` | 26 ns |
-| `store_get/hit` | `get` of an existing key | 57 ns |
-| `store_get/miss` | `get` of a missing key | 34 ns |
-| `store_store/set` | `set` of a new key | 134 ns |
-| `store_get_and_touch/hit` | `gat` of an existing key | 110 ns |
-| `store_arithmetic/incr` | `incr` of an existing key | 100 ns |
-| `read_line/pipelined/1000` | read 1,000 pipelined `get foo` lines | 19.6 µs (~20 ns per line) |
-| `write_response/values/10` | encode a 10-value `get` response | 397 ns |
+| `parse_get/single_key` | parse `get foo` | 25 ns |
+| `parse_store/set` | parse `set foo 0 0 512` | 28 ns |
+| `store_get/hit` | `get` of an existing key | 44 ns |
+| `store_get/miss` | `get` of a missing key | 25 ns |
+| `store_store/set` | `set` of a new key | 85 ns |
+| `store_get_and_touch/hit` | `gat` of an existing key | 59 ns |
+| `store_arithmetic/incr` | `incr` of an existing key | 70 ns |
+| `read_line/pipelined/1000` | read 1,000 pipelined `get foo` lines | 20.9 µs (~21 ns per line) |
+| `write_response/values/10` | encode a 10-value `get` response | 235 ns |
 
-## Design decisions
+## Design
 
-**A task per connection.** Ousagi runs a multi-threaded tokio runtime with `-t` workers (or a single-threaded one with `-t 1`). Every accepted connection gets its own task, a semaphore caps them at `-c`, and `TCP_NODELAY` is enabled so small responses don't wait on Nagle's algorithm.
+**A task per connection.** A tokio runtime with `-t` worker threads runs one task per connection. A semaphore caps connections at `-c`, and `TCP_NODELAY` is on.
 
-**Streaming parser over a reusable buffer.** Each connection reads into one `BytesMut`, finds the end of the line with `memchr`, and tokenizes it in place. Storage commands only parse their header; the data block is read separately into a buffer of the exact size, so the parser never touches value bytes. Lookup keys are zero-copy slices of the line, while keys that end up in the cache are copied, so a cached item doesn't keep a whole read buffer alive. When a storage command is rejected, its data block is still read and discarded so the connection stays in sync.
+**Parsing.** Each connection reads into one reusable buffer and splits lines with `memchr`. Storage commands only parse their header, and the data block is read into a buffer of its exact size. Keys that get stored are copied, so a cached item doesn't keep the read buffer alive. A rejected store still reads its data block to keep the connection in sync.
 
-**Flush when idle, not per response.** Responses are encoded into an output buffer that is sent right before the connection blocks on a read. A client that pipelines 100 commands gets its responses back in a few large writes instead of 100 small ones. `get` hits are encoded straight from the cache into the buffer; values too big to copy are queued by reference instead.
+**Batched writes.** Responses are encoded into an output buffer that is only sent before the connection waits for more input, so pipelined commands get their responses back in a few writes. `get` copies values straight from the cache into that buffer, except large ones, which are queued by reference.
 
-**quick_cache for storage and eviction.** Items live in a sharded, weighted [quick_cache](https://github.com/arthurprs/quick-cache), which evicts with an S3-FIFO-style policy. Each item weighs its key plus its value plus 64 bytes, so `-m` bounds memory approximately rather than exactly. `get` only takes a shard read lock. Commands that read and then write (`add`, `cas`, `incr`, `append`, ...) run under the shard's write lock, so they're atomic per key.
+**Storage.** Items live in [quick_cache](https://github.com/arthurprs/quick-cache), a sharded cache with S3-FIFO-style eviction. Each item weighs its key and value plus 152 bytes of overhead. The cache has 4 shards per CPU, or fewer if needed for a shard to hold a 1 MiB item. `get` takes a shard read lock; commands that read and then write (`add`, `cas`, `incr`, `append`, ...) take the write lock, so they're atomic per key.
 
-**Lazy expiration and a coarse clock.** A background task updates an atomic clock once per second, and items are checked for expiry when they're accessed, then removed. As in memcached, an `exptime` over 30 days is treated as a Unix timestamp. `flush_all <delay>` stores a cutoff time: every item stored before it becomes invisible once the cutoff passes, and a later `flush_all` replaces it.
+**Expiry.** A background task updates a shared clock once per second, and items are checked for expiry when they're accessed. As in memcached, an `exptime` over 30 days is a Unix timestamp. `flush_all <delay>` sets a cutoff, and items stored before it disappear once it passes.
 
-**Stats without contention.** Counters are sharded per thread with [contatori](https://crates.io/crates/contatori) and only summed when someone runs `stats`, so counting hits and misses doesn't become a shared hot spot.
+**Stats.** Counters are sharded per thread with [contatori](https://crates.io/crates/contatori) and only added up when a client runs `stats`.
 
 ## Limitations
 
 - Only the text protocol: no binary protocol, no meta commands (`mg`, `ms`, ...), no UDP, SASL or TLS.
-- No slab allocator. Memory accounting is an estimate, and `-m` doesn't include the cache's own metadata.
+- No slab allocator, so `-m` is an estimate: at `-m 64` full of 128-byte values, the process uses about 82 MiB.
 - Expiry is lazy: there is no LRU crawler, so expired items keep using memory until they're accessed or evicted.
 - `stats` has no subcommands (`stats items`, `stats slabs`, ...) and reports a subset of memcached's fields.
 - `verbosity` is accepted but does nothing; logging is set at startup with `-v` or `RUST_LOG`.
-- The value size limit (1 MiB) isn't configurable like memcached's `-I`.
+- The value size limit (1 MiB, slightly less at `-m 1`) isn't configurable like memcached's `-I`.
 - Command lines are limited to 8 KiB, except `get`/`gets` lines, which can be up to 4 MiB.
 - When the connection limit is reached, new connections wait for a free slot instead of being refused with an error.
 - There's no idle timeout for connections.

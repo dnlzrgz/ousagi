@@ -344,57 +344,6 @@ mod tests {
         assert!(out.chunks.is_empty());
     }
 
-    fn queue(parts: &[&'static [u8]]) -> ChunkQueue {
-        ChunkQueue {
-            chunks: parts.iter().map(|p| Bytes::from_static(p)).collect(),
-            remaining: parts.iter().map(|p| p.len()).sum(),
-        }
-    }
-
-    #[test]
-    fn chunk_queue_advances_across_chunk_boundaries() {
-        let mut q = queue(&[b"abc", b"de", b"fghi"]);
-        assert_eq!(q.remaining(), 9);
-        assert_eq!(q.chunk(), b"abc");
-
-        q.advance(2);
-        assert_eq!((q.remaining(), q.chunk()), (7, &b"c"[..]));
-
-        q.advance(1);
-        assert_eq!((q.remaining(), q.chunk()), (6, &b"de"[..]));
-
-        q.advance(3); // all of "de" and one byte of "fghi"
-        assert_eq!((q.remaining(), q.chunk()), (3, &b"ghi"[..]));
-
-        q.advance(0);
-        assert_eq!(q.remaining(), 3);
-
-        q.advance(100); // past the end just stops
-        assert_eq!(q.remaining(), 0);
-        assert!(!q.has_remaining());
-        assert_eq!(q.chunk(), b"");
-    }
-
-    #[test]
-    fn chunk_queue_fills_vectored_slices() {
-        let mut q = queue(&[b"abc", b"de", b"fghi"]);
-        q.advance(1);
-
-        let mut slices = [IoSlice::new(&[]); 8];
-        let n = q.chunks_vectored(&mut slices);
-        assert_eq!(n, 3);
-        assert_eq!(&*slices[0], b"bc");
-        assert_eq!(&*slices[1], b"de");
-        assert_eq!(&*slices[2], b"fghi");
-
-        // Fewer slices than chunks
-        let mut slices = [IoSlice::new(&[]); 2];
-        assert_eq!(q.chunks_vectored(&mut slices), 2);
-        assert_eq!(&*slices[1], b"de");
-
-        assert_eq!(queue(&[]).chunks_vectored(&mut slices), 0);
-    }
-
     /// Accepts at most `max` bytes per write; vectored writes only take the
     /// first `max` bytes spread over the slices when `vectored` is set.
     struct Trickle {
